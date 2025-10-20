@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>PymeEyes</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2em; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1em; }
+    button { padding: .5rem .8rem; cursor: pointer; }
+    .drop-zone {
+      border: 2px dashed #888;
+      border-radius: 8px;
+      padding: 30px;
+      text-align: center;
+      cursor: pointer;
+      margin-bottom: 1em;
+    }
+    .drop-zone.dragover { background-color: #eef; }
+    #loading { display: none; margin: 1em 0; }
+    .spinner {
+      border: 6px solid #f3f3f3;
+      border-top: 6px solid #3498db;
+      border-radius: 50%;
+      width: 40px; height: 40px;
+      animation: spin 1s linear infinite; margin: auto;
+    }
+    @keyframes spin { 100% { transform: rotate(360deg); } }
+    #popup {
+      display: none;
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: rgba(0,0,0,0.6);
+      justify-content: center;
+      align-items: center;
+    }
+    #popupContent {
+      background: white; padding: 20px; border-radius: 8px;
+      text-align: center;
+    }
+    #popupContent a { display: block; margin: 1em 0; color: blue; }
+  </style>
+</head>
+<body>
+  <header>
+    <button onclick="window.location.href='/dashboard.html'">← Volver al panel</button>
+    <button id="logout">Cerrar sesión</button>
+  </header>
+
+  <h1>Aplicación PymeEyes</h1>
+
+  <div id="dropZone" class="drop-zone">
+    Arrastra una imagen aquí o haz clic para seleccionarla
+    <input type="file" id="fileInput" accept="image/*" style="display:none">
+  </div>
+
+  <label for="startUrl">Introduce una URL:</label><br>
+  <input type="text" id="startUrl" placeholder="https://www.ejemplo.com" style="width:100%;"><br><br>
+
+  <button id="sendBtn">Enviar</button>
+  <button id="resetBtn">Resetear</button>
+
+  <div id="loading"><div class="spinner"></div></div>
+
+  <div id="popup">
+    <div id="popupContent">
+      <h2>Resultado</h2>
+      <a id="resultLink" href="#" target="_blank">Ir al enlace</a>
+      <button id="closePopup">Cerrar</button>
+    </div>
+  </div>
+
+  <script>
+    // Verificar sesión
+    (async () => {
+      const res = await fetch('/api/me');
+      if (!res.ok) location.href = '/index.html';
+    })();
+
+    // Logout
+    document.getElementById('logout').addEventListener('click', async () => {
+      await fetch('/api/logout', { method: 'POST' });
+      location.href = '/index.html';
+    });
+
+    const dropZone = document.getElementById("dropZone");
+    const fileInput = document.getElementById("fileInput");
+    let selectedFile = null;
+
+    dropZone.addEventListener("click", () => fileInput.click());
+    dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+    dropZone.addEventListener("drop", e => {
+      e.preventDefault(); dropZone.classList.remove("dragover");
+      if (e.dataTransfer.files.length > 0) {
+        selectedFile = e.dataTransfer.files[0];
+        dropZone.textContent = "Imagen seleccionada: " + selectedFile.name;
+      }
+    });
+    fileInput.addEventListener("change", e => {
+      if (e.target.files.length > 0) {
+        selectedFile = e.target.files[0];
+        dropZone.textContent = "Imagen seleccionada: " + selectedFile.name;
+      }
+    });
+
+    document.getElementById("sendBtn").addEventListener("click", async () => {
+      const url = document.getElementById("startUrl").value;
+      if (!selectedFile || !url) {
+        alert("Debes seleccionar una imagen y una URL");
+        return;
+      }
+      document.getElementById("loading").style.display = "block";
+      const pngBlob = await toPNG(selectedFile);
+      const formData = new FormData();
+      formData.append("start_url", url);
+      formData.append("file", pngBlob, "upload.png");
+      try {
+        const res = await fetch("https://osint-46xx.onrender.com/match", { method: "POST", body: formData });
+        const text = await res.text();
+        document.getElementById("resultLink").href = text;
+        document.getElementById("resultLink").textContent = text;
+        document.getElementById("popup").style.display = "flex";
+      } catch (err) {
+        alert("Error: " + err.message);
+      } finally {
+        document.getElementById("loading").style.display = "none";
+      }
+    });
+
+    document.getElementById("resetBtn").addEventListener("click", resetForm);
+    document.getElementById("closePopup").addEventListener("click", () => {
+      document.getElementById("popup").style.display = "none";
+      resetForm();
+    });
+
+    function resetForm() {
+      selectedFile = null;
+      dropZone.textContent = "Arrastra una imagen aquí o haz clic para seleccionarla";
+      fileInput.value = "";
+      document.getElementById("startUrl").value = "";
+    }
+
+    function toPNG(file) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        const reader = new FileReader();
+        reader.onload = e => {
+          img.onload = () => {
+            const canvas = document.createElement("canvas");
+            canvas.width = img.width; canvas.height = img.height;
+            const ctx = canvas.getContext("2d");
+            ctx.drawImage(img, 0, 0);
+            canvas.toBlob(blob => resolve(blob), "image/png");
+          };
+          img.src = e.target.result;
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+  </script>
+</body>
+</html>

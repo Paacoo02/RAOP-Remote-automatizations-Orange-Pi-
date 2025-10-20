@@ -1,0 +1,19 @@
+FROM node:20
+
+WORKDIR /app
+
+# Copiar dependencias primero (cache mejor)
+COPY package*.json ./
+RUN npm install
+
+# Instalar wrangler en la build
+RUN npm install -g wrangler@4.38.0
+
+# Copiar el resto del proyecto (incluyendo public/)
+COPY . .
+
+# Exponer puerto para desarrollo
+EXPOSE 8788
+
+# Comando de arranque con IP y puerto correctos
+CMD ["wrangler", "pages", "dev", "public", "--local", "--port", "8788", "--ip", "0.0.0.0"]

@@ -1,0 +1,9 @@
+name = "pymeeyes-pages"
+compatibility_date = "2025-09-17"
+
+[vars]
+SESSION_TTL_SECONDS = 28800
+COOKIE_NAME = "auth"
+ADMIN_USER = "admin"
+ADMIN_PW_HASH = "loquehayasencriptado"
+JWT_SECRET = "clave_super_secreta"

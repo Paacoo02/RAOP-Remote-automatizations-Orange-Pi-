@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Panel – PymeEyes</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      font-family: system-ui, Arial, sans-serif;
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: linear-gradient(135deg, #74ABE2, #5563DE);
+    }
+    .panel-card {
+      background: #fff;
+      padding: 2rem;
+      border-radius: 12px;
+      box-shadow: 0 8px 20px rgba(0,0,0,.2);
+      width: 100%;
+      max-width: 420px;
+      text-align: center;
+      animation: fadeIn .6s ease-out;
+      position: relative;
+    }
+    header {
+      position: absolute;
+      top: 1rem;
+      right: 1rem;
+    }
+    header button {
+      padding: .5rem .8rem;
+      border: none;
+      border-radius: 8px;
+      background: #e74c3c;
+      color: #fff;
+      cursor: pointer;
+      transition: background .2s;
+    }
+    header button:hover {
+      background: #c0392b;
+    }
+    h1 {
+      margin-bottom: 1.5rem;
+      color: #333;
+    }
+    .apps {
+      display: grid;
+      gap: 1rem;
+    }
+    .app-card {
+      padding: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 10px;
+      transition: all .2s;
+      cursor: pointer;
+      background: #fafafa;
+    }
+    .app-card:hover {
+      transform: translateY(-3px);
+      background: #f0f0ff;
+      border-color: #5563DE;
+    }
+    .app-card a {
+      text-decoration: none;
+      color: #333;
+      font-size: 1.1rem;
+      font-weight: 500;
+      display: block;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+  </style>
+</head>
+<body>
+  <div class="panel-card">
+    <header>
+      <button id="logout">Cerrar sesión</button>
+    </header>
+
+    <h1>Panel de Aplicaciones</h1>
+    <div class="apps">
+      <div class="app-card">
+        <a href="/apps/pymeeyes.html">PymeEyes</a>
+      </div>
+      <div class="app-card">
+        <a href="/apps/LaTorre_Auto.html">LaTorre_Auto</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Verificar que la sesión existe
+    (async () => {
+      const res = await fetch('/api/me');
+      if (!res.ok) location.href = '/index.html';
+    })();
+
+    // Cerrar sesión
+    document.getElementById('logout').addEventListener('click', async () => {
+      await fetch('/api/logout', { method: 'POST' });
+      location.href = '/index.html';
+    });
+  </script>
+</body>
+</html>

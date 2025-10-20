@@ -1,0 +1,9 @@
+# requirements.txt
+
+numpy
+opencv-python-headless
+requests
+Pillow
+urllib3
+beautifulsoup4
+lxml

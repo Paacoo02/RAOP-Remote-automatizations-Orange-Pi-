@@ -1,0 +1,9 @@
+{
+  "devDependencies": {
+    "miniflare": "^4.20250917.0"
+  },
+  "scripts": {
+    "dev": "node dev.js"
+  }
+  
+}

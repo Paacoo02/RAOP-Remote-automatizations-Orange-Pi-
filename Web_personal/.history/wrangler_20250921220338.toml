@@ -1,0 +1,15 @@
+name = "pymeeyes-pages"
+compatibility_date = "2025-09-17"
+
+[assets]
+directory = "public"
+
+[miniflare]
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+SESSION_TTL_SECONDS = 28800
+COOKIE_NAME = "auth"
+ADMIN_USER = "admin"
+ADMIN_PW_HASH = "3f8b1c6e5d9a47f8c2b0e3d1a9f6c7e48b2f9d3a7c1e5f0a4d8b7e2c6f3a9d0e"
+JWT_SECRET = "66425620da8fb92324071cc6d23dc6efa5497e095ad487cf8a35d2e2e10b6c94"

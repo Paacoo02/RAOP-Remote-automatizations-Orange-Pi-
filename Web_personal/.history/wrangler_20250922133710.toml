@@ -1,0 +1,17 @@
+name = "pymeeyes-pages"
+compatibility_date = "2025-09-17"
+compatibility_flags = ["nodejs_compat"]   # 👈 mover aquí
+
+[assets]
+directory = "public"
+
+[dev]
+port = 8788
+host = "0.0.0.0"
+
+[vars]
+SESSION_TTL_SECONDS = 28800
+COOKIE_NAME = "auth"
+ADMIN_USER = "admin"
+ADMIN_PW_HASH = "5dced96d4a2005c387e5a549bcb60d3da81265a4b2d6502d47f1c702cf573a4c"
+JWT_SECRET = "66425620da8fb92324071cc6d23dc6efa5497e095ad487cf8a35d2e2e10b6c94"
