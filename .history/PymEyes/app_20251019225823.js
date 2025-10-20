@@ -15,95 +15,61 @@ app.use(express.json());
 /**
  * Función para ejecutar el script de Python (Acepta 3 args)
  */
-function runPythonScraper(startUrl, imagePath, gpuUrl) {
+function runPythonScraper(startUrl, imagePath, gpuUrl) { 
   return new Promise((resolve, reject) => {
-    
-    // --- BLOQUE CORREGIDO ---
-    // Apunta al ejecutable de Python DENTRO de tu entorno virtual.
-    // Ajusta "venv" si tu carpeta se llama diferente (ej: ".venv", "mi_entorno").
-    const pythonExecutable = path.resolve(
-      __dirname,
-      "venv", // <--- Asegúrate que este sea el nombre de tu carpeta venv
-      "bin",
-      "python"
-    );
-    // -------------------------
+    console.log(`🐍 Ejecutando Python: python3 image_scrapper.py "${startUrl}" "${imagePath}" "${gpuUrl}"`);
 
-    // Este log ahora mostrará la ruta completa, lo cual es mejor para depurar
-    console.log(
-      `🐍 Ejecutando Python: ${pythonExecutable} image_scrapper.py "${startUrl}" "${imagePath}" "${gpuUrl}"`
-    );
-
-    // const pythonExecutable = "python3"; // <-- ESTA ES LA LÍNEA ANTIGUA
-    
-    const pythonProcess = spawn(
-      pythonExecutable, // <-- Se usa la ruta completa al venv
-      [
-        "-X",
-        "utf8",
+    const pythonExecutable = "python3"; 
+    const pythonProcess = spawn(pythonExecutable, [
+        "-X", "utf8",
         "image_scrapper.py",
-        startUrl, // sys.argv[1]
-        imagePath, // sys.argv[2]
-        gpuUrl, // sys.argv[3]
-      ],
-      {
-        stdio: ["pipe", "pipe", "pipe"],
-      }
-    );
+        startUrl,   // sys.argv[1]
+        imagePath,  // sys.argv[2]
+        gpuUrl      // sys.argv[3]
+    ], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+    });
 
     let output = "";
     let errorOutput = "";
 
+    // ... (El resto de la función 'runPythonScraper' es idéntica) ...
     pythonProcess.stdout.on("data", (data) => {
-      const chunk = data.toString("utf8");
-      process.stdout.write(`[PY_STDOUT] ${chunk}`);
-      output += chunk;
+        const chunk = data.toString('utf8');
+        process.stdout.write(`[PY_STDOUT] ${chunk}`);
+        output += chunk;
     });
 
     pythonProcess.stderr.on("data", (data) => {
-      const chunk = data.toString("utf8");
-      process.stderr.write(`[PY_STDERR] ${chunk}`);
-      errorOutput += chunk;
+        const chunk = data.toString('utf8');
+        process.stderr.write(`[PY_STDERR] ${chunk}`);
+        errorOutput += chunk;
     });
 
-    pythonProcess.on("error", (spawnError) => {
-      console.error(
-        `❌ Error al intentar ejecutar Python: ${spawnError.message}`
-      );
-      // Error común: "ENOENT" (Error NO ENTry) significa que la ruta al ejecutable es incorrecta.
-      if (spawnError.code === 'ENOENT') {
-           console.error(`👉 Parece que la ruta al Python del venv es incorrecta. Verificando: ${pythonExecutable}`);
-      }
-      reject(
-        new Error(`Fallo al ejecutar el proceso Python: ${spawnError.message}`)
-      );
+    pythonProcess.on('error', (spawnError) => {
+        console.error(`❌ Error al intentar ejecutar Python: ${spawnError.message}`);
+        reject(new Error(`Fallo al ejecutar el proceso Python: ${spawnError.message}`));
     });
 
     pythonProcess.on("close", (code) => {
       console.log(`\n🐍 Proceso Python finalizado con código: ${code}`);
       if (code !== 0) {
         return reject(
-          new Error(
-            `Python script salió con código ${code}. Error: ${
-              errorOutput.trim() || "Error desconocido en Python."
-            }`
-          )
+          new Error(`Python script salió con código ${code}. Error: ${errorOutput.trim() || 'Error desconocido en Python.'}`)
         );
       }
       try {
         const lines = output.trim().split("\n");
         let lastJsonLine = null;
         for (let i = lines.length - 1; i >= 0; i--) {
-          const trimmedLine = lines[i].trim();
-          if (trimmedLine.startsWith("{") && trimmedLine.endsWith("}")) {
-            lastJsonLine = trimmedLine;
-            break;
-          }
+            const trimmedLine = lines[i].trim();
+            if (trimmedLine.startsWith('{') && trimmedLine.endsWith('}')) {
+                lastJsonLine = trimmedLine;
+                break;
+            }
         }
         if (!lastJsonLine) {
-          throw new Error(
-            "No se encontró una línea JSON válida en la salida de Python."
-          );
+             throw new Error("No se encontró una línea JSON válida en la salida de Python.");
         }
         console.log(`🐍 Intentando parsear JSON final: ${lastJsonLine}`);
         const resultJson = JSON.parse(lastJsonLine);
@@ -111,9 +77,7 @@ function runPythonScraper(startUrl, imagePath, gpuUrl) {
       } catch (parseError) {
         console.error("❌ Error al parsear la salida JSON de Python:", parseError);
         reject(
-          new Error(
-            `Falló al parsear la salida de Python como JSON. Output:\n${output}`
-          )
+          new Error(`Falló al parsear la salida de Python como JSON. Output:\n${output}`)
         );
       }
     });

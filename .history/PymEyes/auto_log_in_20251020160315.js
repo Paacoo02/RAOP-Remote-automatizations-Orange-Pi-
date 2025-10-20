@@ -29,6 +29,10 @@ function attachPageResilience(context, pageRef) {
 async function createUndetectableBrowser() {
   console.log('🚀 Creando navegador indetectable…');
 
+  // 👉 En Render, fuerza headless si no defines HEADLESS manualmente
+  const isRender = !!process.env.RENDER;  // Render inyecta esta env
+  const HEADLESS = (process.env.HEADLESS ?? (isRender ? 'true' : 'false')) === 'true';
+
   const browser = await chromium.launch({
     headless: false,
     executablePath: chromium.executablePath(),

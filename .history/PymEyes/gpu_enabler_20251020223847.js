@@ -15,6 +15,7 @@ puppeteer.use(stealth);
 const COLAB_NOTEBOOK_URL =
   "https://colab.research.google.com/drive/14DoEu8zTb-CYiZYbWmzowDy-uhnspvtu?usp=sharing";
 // const NOTEBOOK_ID = "14DoEu8zTb-CYiZYbWmzowDy-uhnspvtu"; // No usado
+const SESSION_FILE = "google_session.json";
 
 // --- Funciones Auxiliares ---
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -60,6 +61,7 @@ try {
 
 } catch (colabNavError) {
    console.error(`❌ Falló la navegación o carga del notebook Colab: ${colabNavError.message}`);
+   await page.screenshot({ path: 'error_colab_navigation.png' });
    // Tomar un volcado del DOM puede ser útil aquí
    // const html = await page.content();
    // fs.writeFileSync('error_colab_dom.html', html);
@@ -126,6 +128,7 @@ try {
       console.log("✅ Celda 1 ejecución iniciada.");
   } catch(e) {
        console.error(`❌ Falló al iniciar la ejecución de la primera celda: ${e.message}`);
+       await page.screenshot({ path: 'error_run_cell_1_init.png' });
        throw e;
   }
 
@@ -162,6 +165,7 @@ try {
     });
 
     if (!clickedMenuItem) {
+      await page.screenshot({ path: "error_menu_item_not_found.png" });
       throw new Error("❌ No se pudo encontrar 'Disconnect and delete runtime' en el menú.");
     }
     console.log("✅ Opción 'Disconnect and delete runtime' pulsada.");
@@ -222,6 +226,7 @@ try {
             yesClicked = true;
         } catch (enterError) {
             console.error("❌ Falló incluso al presionar 'Enter' tras error inicial.", enterError.message);
+            await page.screenshot({ path: 'error_dialogo_confirm_fail.png' });
             // Considera si lanzar el error o continuar asumiendo que pudo funcionar
             // throw error; // Descomenta si fallar aquí debe detener todo
         }
@@ -240,11 +245,13 @@ try {
     } else {
         // Si no se pudo hacer clic ni presionar Enter, es un problema
          console.error("❌ No se pudo confirmar el diálogo 'Yes/No' por ningún método.");
+         await page.screenshot({ path: 'error_dialogo_no_confirmado.png' });
          throw new Error("Fallo al confirmar el reinicio del runtime.");
     }   
 
   } catch (e) {
     console.error("❌ Error detallado al reiniciar el entorno:", e);
+    try { await page.screenshot({ path: 'error_reinicio_general.png' }); } catch {}
     console.log("📸 Se ha guardado una captura de pantalla del error.");
     throw e;
   }
@@ -290,10 +297,16 @@ try {
         if (stopButtonHandle) console.log("✅ Botón de detención encontrado.");
       } catch (e) {
         console.error("❌ Error al leer la salida de la celda 3:", e.message);
+        await page.screenshot({ path: 'error_cloudflare_link.png' }); // Captura si falla aquí
         result = null;
       }
     }
   }
+
+  // Guardar sesión
+  const storage = await context.storageState();
+  fs.writeFileSync(SESSION_FILE, JSON.stringify(storage, null, 2));
+  console.log(`💾 Sesión guardada en ${SESSION_FILE}`);
 
   return { result, stopButtonHandle, page, browser };
 }
