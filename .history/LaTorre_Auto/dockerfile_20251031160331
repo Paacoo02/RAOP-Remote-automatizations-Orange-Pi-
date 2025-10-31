@@ -1,0 +1,32 @@
+# ----------------------------------------------------------------
+# Dockerfile para LaTorre_Auto con Playwright en Linux (solo API)
+# ----------------------------------------------------------------
+
+FROM mcr.microsoft.com/playwright:focal
+
+# Evitar descarga de navegadores extra
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --production
+
+COPY reservaClase.js ./
+COPY vercel.json ./
+COPY api/server.mjs ./api/server.mjs
+COPY api/server_handler.mjs ./api/server_handler.mjs
+COPY cli.mjs ./
+COPY db.mjs ./
+COPY Stealth.js ./
+
+EXPOSE 3000
+
+# Render usará este comando
+CMD ["node", "api/server.mjs"]
+
+
+
+
+
+

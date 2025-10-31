@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1.6
+# ======================================================
+# 💿 Imagen base
+# ======================================================
+FROM node:20-slim
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ======================================================
+# 🔧 Dependencias del sistema (Python + navegador + utilidades)
+# ======================================================
+RUN set -eux; \
+  apt-get update; \
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl wget xz-utils gnupg \
+    python3 python3-venv python3-pip \
+    fonts-liberation libnss3 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 \
+    libxfixes3 libxi6 libxrender1 libxrandr2 libxtst6 libglib2.0-0 libatk1.0-0 libatk-bridge2.0-0 \
+    libdrm2 libgbm1 libasound2 libxkbcommon0 libgtk-3-0 libgtk-4-1 libgtk-4-bin \
+    fonts-freefont-ttf fonts-dejavu fonts-noto-color-emoji \
+    libatomic1 libevent-2.1-7; \
+  rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ======================================================
+# 📦 Node + Playwright (sin lockfile para evitar conflictos)
+# ======================================================
+ENV PLAYWRIGHT_VERSION=1.55.1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN mkdir -p /ms-playwright && chown -R root:root /ms-playwright
+
+# Copiamos solo el package.json
+COPY package.json ./
+
+# Instala dependencias Node + Playwright
+RUN --mount=type=cache,target=/root/.npm bash -lc '\
+  npm install --omit=dev && \
+  npm install playwright@${PLAYWRIGHT_VERSION} && \
+  npx playwright install --with-deps chromium \
+'
+
+# ======================================================
+# 🧠 Python venv + dependencias
+# ======================================================
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=120 --retries=5 --no-cache-dir -r requirements.txt
+
+# ======================================================
+# ⚙️ Copia de código y permisos
+# ======================================================
+COPY . .
+RUN chmod +x /app/start.sh || true
+
+# ======================================================
+# 🌍 Puerto expuesto
+# ======================================================
+EXPOSE 3000
+
+# ======================================================
+# 🚀 Ejecución por defecto (Node.js)
+# ======================================================
+ENV NODE_ENV=production
+CMD ["node", "server.js"]

@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1.6
+
+# ======================================================
+# 💿 Base
+# ======================================================
+FROM node:20-slim
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ======================================================
+# 🔧 Dependencias sistema (Chromium + Python + X)
+# ======================================================
+RUN set -eux; \
+  apt-get update; \
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl wget xz-utils gnupg \
+    python3 python3-venv python3-pip \
+    iproute2 iputils-ping procps \
+    openssh-server xvfb x11vnc fluxbox novnc websockify xauth \
+    # deps típicas de Chromium/Playwright
+    libnss3 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 \
+    libxfixes3 libxi6 libxrender1 libxrandr2 libxtst6 libglib2.0-0 libatk1.0-0 libatk-bridge2.0-0 \
+    libdrm2 libgbm1 libasound2 libxkbcommon0 libgtk-3-0 libgtk-4-1 libgtk-4-bin \
+    libxss1 libxshmfence1 libu2f-udev libatspi2.0-0 \
+    libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
+    fonts-liberation fonts-freefont-ttf fonts-dejavu fonts-noto-color-emoji \
+    libatomic1 libevent-2.1-7; \
+  rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ======================================================
+# 📦 Node + Playwright (binarios en /ms-playwright)
+# ======================================================
+ENV PLAYWRIGHT_VERSION=1.55.1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN mkdir -p /ms-playwright && chown -R root:root /ms-playwright
+
+COPY package.json ./
+# Si tienes package-lock.json, cambia a `npm ci --omit=dev`
+RUN --mount=type=cache,target=/root/.npm bash -lc '\
+  npm install --omit=dev && \
+  npm install playwright@${PLAYWRIGHT_VERSION} && \
+  npx playwright install --with-deps chromium \
+'
+
+# ======================================================
+# 🧠 Python venv EXACTAMENTE donde lo espera tu app
+# ======================================================
+# IMPORTANTE: Tu código invoca /app/venv/bin/python ⇒ creamos ese venv
+RUN python3 -m venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
+
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=120 --retries=5 --no-cache-dir -r requirements.txt
+
+# ======================================================
+# ⚙️ Código y permisos
+# ======================================================
+COPY . .
+RUN chmod +x /app/start.sh || true
+
+# ======================================================
+# 🌍 Exposición
+# ======================================================
+EXPOSE 3000
+
+# ======================================================
+# 🚀 Runtime env (sin tocar tu código)
+# ======================================================
+ENV NODE_ENV=production \
+    DISPLAY=:99 \
+    XVFB_RESOLUTION=1920x1080x24 \
+    HEADLESS=false \
+    TZ=Europe/Madrid \
+    LANG=C.UTF-8
+
+CMD ["bash", "./start.sh"]

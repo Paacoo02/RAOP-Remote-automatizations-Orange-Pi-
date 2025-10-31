@@ -1,0 +1,95 @@
+# syntax=docker/dockerfile:1.6
+
+# ======================================================
+# 💿 Base
+# ======================================================
+FROM node:20-slim
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+# ======================================================
+# 🔧 Sistema (Chromium deps + Python + X) con caché APT
+# ======================================================
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl wget xz-utils gnupg \
+      python3 python3-venv python3-pip \
+      iproute2 iputils-ping procps \
+      openssh-server xvfb x11vnc fluxbox novnc websockify xauth \
+      # deps típicas de Chromium/Playwright
+      libnss3 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 \
+      libxfixes3 libxi6 libxrender1 libxrandr2 libxtst6 libglib2.0-0 libatk1.0-0 libatk-bridge2.0-0 \
+      libdrm2 libgbm1 libasound2 libxkbcommon0 libgtk-3-0 libgtk-4-1 libgtk-4-bin \
+      libxss1 libxshmfence1 libu2f-udev libatspi2.0-0 \
+      libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
+      fonts-liberation fonts-freefont-ttf fonts-dejavu fonts-noto-color-emoji \
+      libatomic1 libevent-2.1-7; \
+    rm -rf /var/lib/apt/lists/*
+
+# ======================================================
+# 📦 Node + Playwright — capas cacheables
+#   1) Copiamos solo manifiestos para no invalidar al cambiar código
+#   2) Cache NPM
+#   3) Instalamos playwright y los binarios en /ms-playwright
+# ======================================================
+ENV PLAYWRIGHT_VERSION=1.55.1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN mkdir -p /ms-playwright
+
+# Copia solo manifiestos (mejor caché)
+COPY package.json ./
+# Si tienes lockfile, descomenta y usa npm ci:
+# COPY package-lock.json ./
+
+# Instala deps de Node con caché
+RUN --mount=type=cache,target=/root/.npm bash -lc '\
+  if [ -f package-lock.json ]; then \
+    npm ci --omit=dev; \
+  else \
+    npm install --omit=dev; \
+  fi \
+'
+
+# Instala versión exacta de Playwright y descarga Chromium (capas separadas)
+RUN --mount=type=cache,target=/root/.npm bash -lc '\
+  npm install playwright@${PLAYWRIGHT_VERSION} \
+'
+RUN --mount=type=cache,target=/root/.cache/ms-playwright bash -lc '\
+  npx playwright install --with-deps chromium \
+'
+
+# ======================================================
+# 🧠 Python venv EXACTO en /app/venv + caché pip
+# ======================================================
+RUN python3 -m venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
+
+# Copiamos solo requirements primero (mejor caché)
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=120 --retries=5 -r requirements.txt
+
+# ======================================================
+# ⚙️ Ahora sí, el resto del código
+# ======================================================
+COPY . .
+RUN chmod +x /app/start.sh || true
+
+# ======================================================
+# 🌍 Exposición + entorno
+# ======================================================
+EXPOSE 3000
+ENV NODE_ENV=production \
+    DISPLAY=:99 \
+    XVFB_RESOLUTION=1920x1080x24 \
+    HEADLESS=false \
+    TZ=Europe/Madrid \
+    LANG=C.UTF-8
+
+# ======================================================
+# 🚀 Entrypoint
+# ======================================================
+CMD ["bash", "./start.sh"]
