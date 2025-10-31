@@ -40,7 +40,10 @@ start_vnc_stack() {
   fi
   websockify --web=/usr/share/novnc 0.0.0.0:${NOVNC_PORT} localhost:5901 >/tmp/novnc.log 2>&1 &
   
+  # --- MODIFICACIÓN AQUÍ ---
+  # Se añade un bucle para esperar a que el puerto de noVNC esté realmente listo.
   echo "⏳ Esperando a que noVNC esté disponible en el puerto ${NOVNC_PORT}..."
+  # (Se usa 'ss' que es más moderno que 'netstat'. El '-tln' lista puertos TCP que están escuchando)
   for i in {1..10}; do
     if ss -tln | grep -q ":${NOVNC_PORT}"; then
       echo "✅ Servicios listos — noVNC en :${NOVNC_PORT}, VNC en :5901"
@@ -50,44 +53,23 @@ start_vnc_stack() {
   done
   
   echo "⚠️  noVNC no pudo iniciarse en el puerto ${NOVNC_PORT}. Revisa /tmp/novnc.log"
+  # --- FIN DE LA MODIFICACIÓN ---
 }
 
 # ====== Lanzamiento ======
 start_ssh
 start_vnc_stack
 
-# --- INICIO DE LA MODIFICACIÓN ---
-# Variables para la app Python (puedes cambiarlas si es necesario)
-PYTHON_SCRIPT="/app/main.py"
-VENV_PATH="/app/venv"
-
-# Lanzar app (Prioritiza Python, luego Node)
-if [[ -f "${PYTHON_SCRIPT}" ]] && [[ -f "${VENV_PATH}/bin/activate" ]]; then
-  echo "🐍 Lanzando app Python desde venv..."
-  export DISPLAY=":99"
-  echo "🎬 Activando ${VENV_PATH} y ejecutando ${PYTHON_SCRIPT} en DISPLAY=${DISPLAY}"
-  
-  # 'source' activa el venv en el shell actual
-  # shellcheck source=/app/venv/bin/activate
-  source "${VENV_PATH}/bin/activate"
-  
-  # Ejecutar el script de Python (con '|| true' para que el contenedor no muera si falla)
-  python "${PYTHON_SCRIPT}" || true
-  
-  # Desactivar el venv (buena práctica)
-  deactivate || true
-
-elif [[ -f /app/app.js ]]; then
-  echo "🚀 (Fallback) Lanzando app Node con entorno gráfico..."
+# Lanzar app Node opcional (si existe)
+if [[ -f /app/app.js ]]; then
+  echo "🚀 Lanzando app Node con entorno gráfico..."
   export DISPLAY=":99"
   sleep 1
   echo "🎬 Ejecutando gpu_enabler.js en DISPLAY=${DISPLAY}"
   node /app/app.js || true
 else
-  echo "ℹ️  No se encontró script de Python (${PYTHON_SCRIPT}) ni de Node (/app/app.js) — omitiendo ejecución."
+  echo "ℹ️  No se encontró /app/app.js — omitiendo ejecución Node."
 fi
-# --- FIN DE LA MODIFICACIÓN ---
-
 
 # ====== Mantener contenedor activo ======
 echo "🌀 Contenedor activo — SSH (22), noVNC (${NOVNC_PORT}) y VNC (5901) disponibles."

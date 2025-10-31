@@ -18,6 +18,10 @@ async function ensurePage(context, pageRef) {
 function attachPageResilience(context, pageRef) {
   try { pageRef.page.removeAllListeners('close'); } catch {}
   try { pageRef.page.removeAllListeners('crash'); } catch {}
+  pageRef.page.on('close', async () => {
+    console.log('⚠️ page.close detectado');
+    await ensurePage(context, pageRef);
+  });
   pageRef.page.on('crash', async () => {
     console.log('💥 page.crash detectado');
     try { await pageRef.page.close().catch(()=>{}); } catch {}
@@ -29,9 +33,12 @@ function attachPageResilience(context, pageRef) {
 async function createUndetectableBrowser() {
   console.log('🚀 Creando navegador indetectable…');
 
+  // 👉 En Render, fuerza headless si no defines HEADLESS manualmente
+  const isRender = !!process.env.RENDER;  // Render inyecta esta env
+  const HEADLESS = (process.env.HEADLESS ?? (isRender ? 'true' : 'false')) === 'true';
+
   const browser = await chromium.launch({
     headless: false,
-    executablePath: chromium.executablePath(),
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -44,8 +51,6 @@ async function createUndetectableBrowser() {
       '--no-first-run',
       '--no-default-browser-check',
       '--window-size=1920,1080',
-      '--force-dark-mode',
-      '--enable-features=WebUIDarkMode',
     ],
     ignoreDefaultArgs: ['--enable-automation'],
   });
@@ -201,34 +206,15 @@ async function attemptGoogleLogin() {
   }
 
   // Cierra landing y devuelve pestaña limpia
-  // --- COMIENZA EL BLOQUE CORREGIDO ---
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-await sleep(5000);
-console.log('✅ Login completado, buscando la pestaña final de Drive...');
-const allPages = await context.pages();
-let drivePage = allPages.find(p => p.url().includes('drive.google.com'));
+  if (pageRef.page && !pageRef.page.isClosed()) {
+    await pageRef.page.close().catch(()=>{});
+    console.log('🗑️ Pestaña inicial cerrada');
+  }
+  pageRef.page = await context.newPage();
+  await pageRef.page.route('**/*', r => r.continue());
+  attachPageResilience(context, pageRef);
 
-if (!drivePage) {
-  // Si no se encuentra, puede que aún esté navegando, damos un momento
-  await pageRef.page.waitForTimeout(2000);
-  drivePage = (await context.pages()).find(p => p.url().includes('drive.google.com'));
-}
-
-if (!drivePage) {
-    throw new Error('No se pudo encontrar la página de Google Drive después del login.');
-}
-
-// Cierra todas las pestañas EXCEPTO la de Drive para limpiar
-for (const page of allPages) {
-    if (page !== drivePage && !page.isClosed()) {
-        await page.close().catch(() => {});
-    }
-}
-console.log('🧹 Pestañas innecesarias cerradas.');
-
-// Devuelve la pestaña correcta y logueada de Google Drive
-return { browser, context, page: drivePage };
-// --- TERMINA EL BLOQUE CORREGIDO ---
+  return { browser, context, page: pageRef.page };
 }
 
 module.exports = {
@@ -236,5 +222,4 @@ module.exports = {
   handleGoogleLogin,
   createUndetectableBrowser,
   gotoWithRetry,          // 👈 exportado
-  
 };
