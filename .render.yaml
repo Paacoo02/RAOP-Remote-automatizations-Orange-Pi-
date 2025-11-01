@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: vscode-cloud
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PASSWORD
+        value: pon-una-contraseña-fuerte
