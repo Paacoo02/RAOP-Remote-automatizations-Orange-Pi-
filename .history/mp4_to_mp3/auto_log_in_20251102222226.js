@@ -484,7 +484,7 @@ async function uploadFileToSpecificFolderUI(filePath) {
     await waitForDriveReady(page);
     await clearOverlays(page);
 
-    const desiredName = 'video.mp4';
+    const desiredName = 'Video.mp4';
 
     if (DELETE_BEFORE_UPLOAD) {
       await trashExistingFile(page, desiredName).catch(()=>{});

@@ -1,4 +1,4 @@
-// app.js (secuencial: Drive -> GPU Colab -> Python remoto)
+// app.js (secuencial: Drive -> GPU Colab -> Python local)
 const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
@@ -10,11 +10,6 @@ const cors = require("cors");
 // Helpers externos (ya existentes en tu proyecto)
 const { uploadFileToDriveUI } = require("./auto_log_in.js"); // UI Drive
 const { enableGpuAndRun } = require("./gpu_enabler.js");     // Colab GPU
-
-// Helpers de túnel
-const axios = require("axios");
-const dns = require("dns").promises;
-const { URL } = require("url");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -37,7 +32,7 @@ app.use(cors({
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 
-// Subidas a /tmp (solo para la subida UI a Drive)
+// Subidas a /tmp
 const upload = multer({
   dest: os.tmpdir(),
   limits: { fileSize: 1024 * 1024 * 1024 }, // 1 GB
@@ -79,50 +74,9 @@ function runPythonScript(scriptRelPath, args) {
     p.on("close", (code) => {
       console.log(`🐍 Python terminó con código: ${code}`);
       if (code === 0) return resolve(out.trim());
-      reject(new Error(`Script salió con código ${code}. STDERR: ${err || "(vacío)"}\nSTDOUT: ${out || "(vacío)"}`));
+      reject(new Error(`Script salió con código ${code}. STDERR: ${err || "(vacío)"}`));
     });
   });
-}
-
-// ===== Helpers de Túnel (espera activa a Cloudflare/worker) =====
-async function waitForTunnelReady(baseUrl, { maxWaitMs = 45000, stepMs = 800 } = {}) {
-  if (!/^https?:\/\//i.test(baseUrl)) throw new Error("gpuUrl inválida");
-  const u = new URL(baseUrl);
-  const deadline = Date.now() + maxWaitMs;
-  let lastErr = "unknown";
-
-  // probamos http y https por si el worker solo expuso uno
-  const candidates = Array.from(new Set([
-    baseUrl.replace(/^http:/i, "https:"),
-    baseUrl.replace(/^https:/i, "http:")
-  ])).map(x => x.replace(/\/+$/,""));
-
-  while (Date.now() < deadline) {
-    for (const cand of candidates) {
-      try {
-        // 1) DNS
-        await dns.lookup(u.hostname);
-
-        // 2) /health
-        const health = await axios.get(cand + "/health", { timeout: 2500, validateStatus: () => true });
-        if (health.status === 200) return cand;
-
-        // 3) /execute (eco) — prueba real de endpoint
-        const exec = await axios.post(
-          cand + "/execute",
-          { script_content: "import json; print(json.dumps({'ok': True,'ping':'pong'}))", params: [] },
-          { timeout: 2500, validateStatus: () => true }
-        );
-        if (exec.status === 200) return cand;
-
-        lastErr = `health=${health.status} exec=${exec.status}`;
-      } catch (e) {
-        lastErr = e.message || String(e);
-      }
-    }
-    await new Promise(r => setTimeout(r, stepMs));
-  }
-  throw new Error("tunnel_not_ready: " + lastErr);
 }
 
 // ===== Multer fields =====
@@ -143,7 +97,7 @@ function pickUploadedFile(req) {
   );
 }
 
-// ===== Detección básica de tipo (solo informativa) =====
+// ===== Detección básica de tipo =====
 function guessMediaKind(originalName, mimetype) {
   const ext = (path.extname(originalName || "").toLowerCase());
   const typeRoot = (mimetype || "").split("/")[0];
@@ -157,10 +111,10 @@ function guessMediaKind(originalName, mimetype) {
   return { isVideo, isAudio, ext };
 }
 
-// ===== Endpoint: orden estricto Drive -> GPU -> Python (solo URL) =====
+// ===== Endpoint: orden estricto Drive -> GPU -> Python =====
 app.post("/match", uploadFields, async (req, res) => {
   console.log("📥 POST /match recibido");
-  let browserToClose = null;
+  let browserToClose = null; // para cerrar el navegador del gpu_enabler si se abrió
 
   try {
     const f = pickUploadedFile(req);
@@ -173,61 +127,82 @@ app.post("/match", uploadFields, async (req, res) => {
     const mimetype     = f.mimetype || "";
     const { isVideo, isAudio } = guessMediaKind(originalName, mimetype);
 
-    // === 1) Subir ORIGINAL a Drive por UI (bloqueante) ===
+    // === 1) Subir a Drive por UI (bloqueante) ===
     console.log("① Subiendo archivo a Drive (UI)...");
-    const uploadedOriginal = await uploadFileToDriveUI(localPath, { folderName: "Videos" });
-    console.log("✅ Subida finalizada:", uploadedOriginal?.name || originalName);
+    const uploaded = await uploadFileToDriveUI(localPath, { folderName: "Videos" });
+    console.log("✅ Subida finalizada:", uploaded?.name || originalName);
 
-    // === 2) Arrancar GPU en Colab y ESPERAR túnel (bloqueante) ===
+    // === 2) Arrancar GPU en Colab (bloqueante) ===
     console.log("② Arrancando GPU en Colab (gpu_enabler)...");
-    let gpuUrl = "";
+    let gpuUrl = "NONE";
     try {
       const { result, browser } = await enableGpuAndRun();
-      browserToClose = browser || null;
-      const rawUrl = result || "";
-      console.log("⏳ Verificando disponibilidad del túnel...", rawUrl);
-      gpuUrl = await waitForTunnelReady(rawUrl, { maxWaitMs: 45000, stepMs: 800 });
-      console.log("✅ GPU URL lista:", gpuUrl);
+      browserToClose = browser || null; // lo cerraremos en finally
+      gpuUrl = result || "NONE";
+      console.log("✅ GPU URL:", gpuUrl);
     } catch (e) {
-      console.error("⚠️ GPU no lista:", e.message);
-      return res.status(502).json({ ok: false, error: "gpu_url_unavailable", detail: e.message });
+      console.error("⚠️ Falló el arranque de GPU:", e.message);
     }
 
-    // === 3) Ejecutar script Python REMOTO (solo le pasamos LA URL) ===
-    console.log("③ Ejecutando script Python remoto (solo GPU URL)...");
-    let pythonOutput = null;
+    // === 3) Ejecutar script Python local (bloqueante) ===
+    console.log("③ Ejecutando script Python local...");
+
+    // Construimos la ruta de salida MP3 (mismo /tmp)
+    const baseName = path.parse(originalName).name || path.parse(localPath).name;
+    const mp3Local = path.join(path.dirname(localPath), `${baseName}.mp3`);
+
+    let pipelineOutput = null;
     try {
-      pythonOutput = await runPythonScript("mp4_to_mp3.py", [gpuUrl]);
-      console.log("✅ Python remoto OK");
+      // Orden correcto: input_path, output_path, server_base_or_NONE
+      pipelineOutput = await runPythonScript("mp4_to_mp3.py", [
+        localPath,        // 1º: input
+        mp3Local,         // 2º: output
+        gpuUrl || "NONE", // 3º: URL Colab (trycloudflare) o "NONE"
+      ]);
+      console.log("✅ Conversión a MP3 terminada:", mp3Local);
     } catch (e) {
-      console.error("🔥 Error en ejecución Python remota:", e.message);
-      return res.status(500).json({ ok: false, error: "python_remote_failed", detail: e.message });
+      console.error("🔥 Error en pipeline Python:", e.message);
     }
 
-    // Limpieza del archivo local subido
+    // === 4) (Opcional) Subir MP3 resultante a Drive (UI) ===
+    let uploadedMp3 = null;
+    try {
+      if (fs.existsSync(mp3Local)) {
+        uploadedMp3 = await uploadFileToDriveUI(mp3Local, { folderName: "Videos" });
+        console.log("📤 MP3 subido a Drive:", uploadedMp3?.name || path.basename(mp3Local));
+      } else {
+        console.warn("⚠️ mp3Local no existe; se omite subida del MP3.");
+      }
+    } catch (e) {
+      console.error("⚠️ Fallo subiendo MP3 a Drive:", e.message);
+    }
+
+    // Limpieza del archivo local subido (elimina original; MP3 lo dejamos si falló la subida)
     try { if (fs.existsSync(localPath)) fs.rmSync(localPath, { force: true }); } catch {}
 
-    // Respuesta clara (el Python devuelve JSON en stdout; aquí lo enviamos tal cual + info extra)
-    let pipeline = {};
-    try { pipeline = JSON.parse(pythonOutput); } catch (_) { pipeline = { raw: pythonOutput }; }
-
+    // Respuesta clara
     return res.json({
       ok: true,
       type: isVideo ? "video" : (isAudio ? "audio" : "other"),
       drive: {
-        original: uploadedOriginal   // resultado de la subida del original
+        original: uploaded,   // resultado de la subida del original
+        mp3: uploadedMp3,     // resultado de la subida del mp3 (si hubo)
       },
-      gpu: { url: gpuUrl },         // URL Cloudflare lista
-      pipeline                       // salida del script Python remoto (incluye rutas en Drive)
+      gpu: { url: gpuUrl },   // URL de Cloudflare (o "NONE")
+      pipeline: { output: pipelineOutput } // salida del script Python (JSON string)
     });
 
   } catch (err) {
     console.error("🔥 Error en /match:", err);
     return res.status(500).json({ error: err.message || String(err) });
   } finally {
+    // Cerrar navegador de gpu_enabler si quedó abierto
     if (browserToClose) {
-      try { if (browserToClose.isConnected()) await browserToClose.close(); }
-      catch (e) { console.error("⚠️ Error cerrando el navegador de gpu_enabler:", e.message); }
+      try {
+        if (browserToClose.isConnected()) await browserToClose.close();
+      } catch (e) {
+        console.error("⚠️ Error cerrando el navegador de gpu_enabler:", e.message);
+      }
     }
   }
 });
