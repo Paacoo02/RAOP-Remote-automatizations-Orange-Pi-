@@ -5,12 +5,12 @@ const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 chromium.use(stealth);
 
-// === Carpeta fija (u/1) ===
+/* ================== CONFIG ================== */
 const FIXED_FOLDER_URL = 'https://drive.google.com/drive/u/1/folders/1YROi4erJExtApAxCPbm9G0gjAHPPs8ir';
-const DELETE_BEFORE_UPLOAD = true;        // borrar antes para evitar diálogo
-const MAKE_LINK_PUBLIC = false;           // si quieres poner “Cualquiera con enlace”
+const DELETE_BEFORE_UPLOAD = true;          // borrar antes para evitar diálogo
+const MAKE_LINK_PUBLIC = false;             // poner “Cualquiera con enlace” (opcional)
 
-// ---------- helpers ----------
+/* ================== HELPERS BÁSICOS ================== */
 async function ensurePage(context, pageRef) {
   if (pageRef.page && !pageRef.page.isClosed()) return pageRef.page;
   console.log('🆘 Page cerrada; creando una nueva pestaña…');
@@ -29,7 +29,7 @@ function attachPageResilience(context, pageRef) {
   });
 }
 
-// ---------- lanzar navegador/contexto ----------
+/* ================== BROWSER INDETECTABLE ================== */
 async function createUndetectableBrowser() {
   console.log('🚀 Creando navegador indetectable…');
   const browser = await chromium.launch({
@@ -47,8 +47,8 @@ async function createUndetectableBrowser() {
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    locale: 'en-US',
-    timezoneId: 'America/Los_Angeles'
+    locale: 'es-ES',
+    timezoneId: 'Europe/Madrid'
   });
   await context.addInitScript(() => {
     try { delete Object.getPrototypeOf(navigator).webdriver; } catch {}
@@ -60,7 +60,7 @@ async function createUndetectableBrowser() {
   return { browser, context, page: pageRef.page, pageRef };
 }
 
-// ---------- goto con reintentos ----------
+/* ================== GOTO CON REINTENTOS ================== */
 async function gotoWithRetry(context, pageRef, url, opts = {}) {
   const max = 3;
   for (let i = 1; i <= max; i++) {
@@ -78,7 +78,7 @@ async function gotoWithRetry(context, pageRef, url, opts = {}) {
   }
 }
 
-// ---------- login ----------
+/* ================== LOGIN GOOGLE ================== */
 async function handleGoogleLogin(authPage, context) {
   const EMAIL = process.env.GOOGLE_USER || 'pacoplanestomas';
   const PASS  = process.env.GOOGLE_PASS  || '392002Planes0.';
@@ -86,7 +86,7 @@ async function handleGoogleLogin(authPage, context) {
 
   if (!/accounts\.google\.com/.test(authPage.url())) {
     await authPage.goto(
-      'https://accounts.google.com/v3/signin/identifier?service=wise&hl=en&flowName=GlifWebSignIn&flowEntry=ServiceLogin&continue=https%3A%2F%2Fdrive.google.com%2Fdrive%2Fmy-drive',
+      'https://accounts.google.com/v3/signin/identifier?service=wise&hl=es&flowName=GlifWebSignIn&flowEntry=ServiceLogin&continue=https%3A%2F%2Fdrive.google.com%2Fdrive%2Fmy-drive',
       { waitUntil: 'domcontentloaded', timeout: 60000 }
     );
   }
@@ -99,7 +99,7 @@ async function handleGoogleLogin(authPage, context) {
   await emailBox.click();
   await emailBox.type(EMAIL, { delay: 60 });
 
-  const nextId = authPage.locator('#identifierNext:visible, div[role="button"]:has-text("Next"):visible, div[role="button"]:has-text("Siguiente"):visible').first();
+  const nextId = authPage.locator('#identifierNext:visible, div[role="button"]:has-text("Siguiente"), div[role="button"]:has-text("Next")').first();
   await nextId.waitFor({ state: 'visible', timeout: 15000 });
   await Promise.all([authPage.waitForLoadState('domcontentloaded'), nextId.click()]);
 
@@ -113,7 +113,7 @@ async function handleGoogleLogin(authPage, context) {
   await passBox.click();
   await passBox.type(PASS, { delay: 50 });
 
-  const nextPwd = authPage.locator('#passwordNext:visible, div[role="button"]:has-text("Next"):visible, div[role="button"]:has-text("Siguiente"):visible').first();
+  const nextPwd = authPage.locator('#passwordNext:visible, div[role="button"]:has-text("Siguiente"), div[role="button"]:has-text("Next")').first();
   await nextPwd.waitFor({ state: 'visible', timeout: 15000 });
   await Promise.all([authPage.waitForLoadState('domcontentloaded'), nextPwd.click()]);
 
@@ -193,9 +193,7 @@ async function attemptGoogleLogin() {
   return { browser, context, page: drivePage };
 }
 
-/* ========================================================================== */
-/* ==================== UTILIDADES DE DRIVE (UI) ============================ */
-/* ========================================================================== */
+/* ================== UTILIDADES DRIVE ================== */
 async function waitForDriveReady(page, timeout = 60000) {
   await page.waitForLoadState('domcontentloaded', { timeout }).catch(()=>{});
   const markers = ['div[role="main"]','div[guidedhelpid="drive_main_page"]','#drive_main_page','c-wiz'];
@@ -237,7 +235,7 @@ async function clickUploadFileItem(page) {
     'div[role="menuitem"][aria-hidden="false"][aria-disabled="false"]:has-text("File upload")',
     'div[role="menuitem"]:not([aria-hidden="true"]):not([aria-disabled="true"]):has-text("Subir archivo")',
     'div[role="menuitem"]:not([aria-hidden="true"]):not([aria-disabled="true"]):has-text("File upload")',
-    'div.a-v-T[aria-label="Subir archivo"]:visible', 'div.a-v-T[data-tooltip="Subir archivo"]:visible'
+    'div.a-v-T[aria-label="Subir archivo"]:visible','div.a-v-T[data-tooltip="Subir archivo"]:visible'
   ].join(', ')).first();
   await item.waitFor({ state: 'visible', timeout: 10000 });
   await item.scrollIntoViewIfNeeded().catch(()=>{});
@@ -254,7 +252,7 @@ async function trySetInputFilesFallback(page, fileSpec, timeout = 7000) {
   } catch { return false; }
 }
 
-/* === 3 puntos → mover a papelera === */
+/* ================== BORRADO PREVIO (opcional) ================== */
 async function findRowByName(page, name) {
   const candidates = [
     `div[role="row"]:has([aria-label*="${name}"])`,
@@ -270,13 +268,8 @@ async function findRowByName(page, name) {
   return null;
 }
 async function openRowOverflowMenu(page, rowLoc) {
-  const kebab = rowLoc.locator('div.pYTkkf-c-RLmnJb').first();
-  const fallbacks = [
-    rowLoc.locator('[aria-label*="Más acciones"], [aria-label*="More actions"]').first(),
-    rowLoc.locator('button[aria-haspopup="menu"]').first(),
-  ];
+  const kebab = rowLoc.locator('div.pYTkkf-c-RLmnJb, button[aria-haspopup="menu"]').first();
   try { await kebab.waitFor({ state: 'visible', timeout: 1500 }); await kebab.click(); return true; } catch {}
-  for (const fb of fallbacks) { try { await fb.waitFor({ state: 'visible', timeout: 1200 }); await fb.click(); return true; } catch {} }
   try { await rowLoc.click({ button: 'right' }); return true; } catch {}
   return false;
 }
@@ -302,154 +295,145 @@ async function trashExistingFile(page, name) {
   await row.click({ position: { x: 10, y: 10 } }).catch(()=>{});
   const opened = await openRowOverflowMenu(page, row);
   if (!opened) { console.log('⚠️ No se pudo abrir el menú; probamos tecla Delete…'); await page.keyboard.press('Delete').catch(()=>{}); await page.keyboard.press('Backspace').catch(()=>{}); return true; }
-  await clickMoveToTrashInMenu(page).catch(async () => { const reopen = await openRowOverflowMenu(page, row); if (reopen) await clickMoveToTrashInMenu(page).catch(()=>{}); });
+  await clickMoveToTrashInMenu(page).catch(async () => {
+    const reopen = await openRowOverflowMenu(page, row);
+    if (reopen) await clickMoveToTrashInMenu(page).catch(()=>{});
+  });
   return true;
 }
 
-/* === diálogo conflicto (por si no borras antes) === */
+/* ================== DIÁLOGO CONFLICTO (si no borras antes) ================== */
 async function handleUploadConflictDialog(page, totalTimeoutMs = 20000) {
   const start = Date.now();
   while (Date.now() - start < totalTimeoutMs) {
     const dialog = page.locator('div[role="dialog"]:visible')
       .filter({ hasText: /Opciones de subida|Upload options|ya está en esta ubicación|already exists/i }).first();
     if (await dialog.count()) {
-      try { const replaceRadio = dialog.locator('label:has-text("Reemplazar archivo actual"), label:has-text("Replace existing file")').first(); if (await replaceRadio.count()) await replaceRadio.click().catch(()=>{}); } catch {}
-      try { const uploadBtn = dialog.locator('button:has-text("Subir"), div[role="button"]:has-text("Subir"), button:has-text("Upload"), div[role="button"]:has-text("Upload")').last(); await uploadBtn.click(); console.log('✅ “Subir” confirmado'); return true; } catch {}
-      await dialog.focus().catch(()=>{}); await page.keyboard.press('Enter').catch(()=>{}); return true;
+      try {
+        const replaceRadio = dialog.locator('label:has-text("Reemplazar archivo actual"), label:has-text("Replace existing file")').first();
+        if (await replaceRadio.count()) await replaceRadio.click().catch(()=>{});
+      } catch {}
+      try {
+        const uploadBtn = dialog.locator('button:has-text("Subir"), div[role="button"]:has-text("Subir"), button:has-text("Upload"), div[role="button"]:has-text("Upload")').last();
+        await uploadBtn.click(); console.log('✅ “Subir” confirmado'); return true;
+      } catch {}
+      await dialog.focus().catch(()=>{});
+      await page.keyboard.press('Enter').catch(()=>{});
+      return true;
     }
     await page.waitForTimeout(200);
   }
   return false;
 }
 
-/* === ESPERA ROBUSTA DE FIN DE SUBIDA === */
-async function waitForUploadFinishRobust(page, name, maxMs = 5 * 60 * 1000) {
+/* ================== ESPERA ESTRICTA: <tr role="row" data-id> ================== */
+/**
+ * Busca la fila REAL del grid (no chips/toasts) validando:
+ *  - <tr role="row" data-id="..."> presente
+ *  - Contiene el nombre exacto del archivo
+ *  - Evita falsos positivos que contengan “Subida de archivo”, “subiendo”, etc.
+ *  - (Best-effort) verifica que existan celdas “típicas” (tamaño/propietario)
+ */
+async function waitForFileRowByDataIdOrName(page, fileName, timeoutMs = 5 * 60 * 1000) {
   const start = Date.now();
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // Funciones helper usadas dentro del bucle
-  const isProgressActive = async () => {
-    // chips de progreso / barras / textos “Subiendo…”
-    return await page.evaluate(() => {
-      const q = (sel)=>Array.from(document.querySelectorAll(sel));
-      const chips = q('[aria-live="polite"], [aria-live="assertive"], [role="progressbar"], [class*="upload"]');
-      const txt = chips.some(el => /subiendo|uploading|cargando/i.test(el.textContent || ''));
-      const bars = q('[role="progressbar"]');
-      return txt || bars.length > 0;
-    }).catch(()=>false);
+  const softRefresh = async () => {
+    try {
+      await page.keyboard.press('ControlOrMeta+R');
+      await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(()=>{});
+      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(()=>{});
+    } catch {}
   };
-  const rowExists = async () => {
-    const loc = page.locator(`div[role="gridcell"][aria-label*="${name}"], div[role="row"]:has([aria-label*="${name}"]), div[aria-label*="${name}"]`).first();
-    try { await loc.waitFor({ state: 'visible', timeout: 800 }); return loc; } catch { return null; }
+  const hopRecentsAndBack = async () => {
+    try {
+      const recent = page.locator('a[aria-label*="Recientes"], a[aria-label*="Recent"]').first();
+      if (await recent.count()) {
+        await recent.click().catch(()=>{});
+        await page.waitForLoadState('domcontentloaded').catch(()=>{});
+        await page.waitForTimeout(700).catch(()=>{});
+      }
+    } catch {}
+    try {
+      const url = FIXED_FOLDER_URL.includes('?') ? `${FIXED_FOLDER_URL}&hl=es` : `${FIXED_FOLDER_URL}?hl=es`;
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(()=>{});
+    } catch {}
   };
 
-  // 1) Espera activa mientras haya progreso; si aparece el toast, mejor
-  while (Date.now() - start < maxMs) {
-    // ¿apareció el toast de completado?
-    const toast = page.locator('div[role="alert"]:has-text("Subida completada"), div[role="alert"]:has-text("Upload complete")').first();
-    if (await toast.count()) { console.log('🔔 Toast de completado visto'); break; }
+  const getCandidateInfo = async () => {
+    return await page.evaluate((name) => {
+      const norm = (s)=> (s||'').toLowerCase();
+      const rows = Array.from(document.querySelectorAll('tr[role="row"][data-id]'));
+      for (const tr of rows) {
+        const text = (tr.innerText || tr.textContent || '').trim();
+        if (!text) continue;
+        const t = norm(text);
+        if (/(subida\s+de\s+archivo|uploading|subiendo)/i.test(t)) continue;
+        if (!t.includes(norm(name))) continue;
 
-    // ¿ya está la fila?
-    const row = await rowExists();
-    if (row) { console.log('🧩 Fila encontrada sin toast'); return row; }
+        // Verificar presencia de celdas típicas (coincide con HTML de ejemplo del usuario)
+        const hasNameStrong = !!tr.querySelector('strong.DNoYtb');       // nombre visible
+        const hasOwnerCell  = !!tr.querySelector('[data-column-field="8"] .WQJtxb'); // “yo” etc.
+        const hasSizeCell   = !!tr.querySelector('[data-column-field="3"] .WQJtxb'); // “12,8 MB”
+        const okMeta = hasNameStrong || (hasOwnerCell && hasSizeCell);
 
-    // ¿sigue el progreso?
-    if (!(await isProgressActive())) {
-      // no parece haber progreso: refuerza con “Recientes” → volver
-      console.log('🔄 No hay progreso visible, refrescando vista…');
-      await openRecentAndComeBack(page).catch(()=>{});
-      const r2 = await rowExists();
-      if (r2) return r2;
+        if (!okMeta) continue;
+
+        return {
+          id: tr.getAttribute('data-id') || null,
+          hasNameStrong, hasOwnerCell, hasSizeCell
+        };
+      }
+      return null;
+    }, fileName).catch(()=>null);
+  };
+
+  // Pequeña holgura para que aparezca la fila tras iniciar subida
+  await sleep(1500);
+
+  let cycle = 0;
+  while (Date.now() - start < timeoutMs) {
+    // ¿Aún hay indicadores de progreso?
+    const progress = await page.evaluate(() =>
+      !!document.querySelector('[role="progressbar"], [aria-live="polite"], [aria-live="assertive"]')
+    ).catch(()=>false);
+
+    const info = await getCandidateInfo();
+    if (info && info.id && (!progress)) {
+      console.log('🧩 Fila real detectada:', info);
+      const row = page.locator(`tr[role="row"][data-id="${info.id}"]`).first();
+      try { await row.waitFor({ state: 'visible', timeout: 4000 }); } catch {}
+      return { fileId: info.id, row };
     }
 
-    await page.waitForTimeout(1000);
+    // Alternar estrategias para forzar indexado/render
+    cycle++;
+    if (cycle % 6 === 1) {
+      await softRefresh();
+    } else if (cycle % 6 === 3) {
+      await hopRecentsAndBack();
+    }
+
+    await sleep(500);
   }
 
-  // 2) Último intento: hard refresh de la carpeta
-  console.log('♻️  Refrescando carpeta para forzar listado…');
-  await page.keyboard.press('ControlOrMeta+R').catch(()=>{});
-  await waitForDriveReady(page);
-  const last = await rowExists();
-  if (last) return last;
-
-  throw new Error('No se encontró el archivo tras la subida.');
+  throw new Error(`Timeout esperando la fila real <tr data-id> para "${fileName}".`);
 }
 
-/* Navega a “Recientes” y vuelve a la carpeta para forzar re-render */
-async function openRecentAndComeBack(page) {
-  // Abre “Recientes”
-  const recent = page.locator('a[aria-label*="Recientes"], a[aria-label*="Recent"]').first();
-  if (await recent.count()) {
-    await recent.click().catch(()=>{});
-    await page.waitForLoadState('domcontentloaded').catch(()=>{});
-    await page.waitForTimeout(800).catch(()=>{});
-  }
-  // Vuelve usando la URL actual de la carpeta
-  await page.goto(FIXED_FOLDER_URL + '?hl=es', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
-  await waitForDriveReady(page);
-}
-
-/* === detalles → fileId === (se mantiene, pero ya no se usa en el flujo "rápido") */
-async function getFileIdFromDetails(page, row) {
-  await row.click({ button: 'right' }).catch(()=>{});
-  const detailsBtn = page.locator([
-    'div[role="menuitem"]:has-text("Ver detalles")',
-    'div[role="menuitem"]:has-text("Detalles")',
-    'div[role="menuitem"]:has-text("View details")',
-    'div[role="menuitem"]:has-text("Details")'
-  ].join(', ')).first();
-  if (await detailsBtn.count()) await detailsBtn.click().catch(()=>{});
-  const link = page.locator('a[href*="/file/d/"]').first();
-  try {
-    await link.waitFor({ state: 'visible', timeout: 6000 });
-    const href = await link.getAttribute('href');
-    const m = href && href.match(/\/file\/d\/([^/]+)/);
-    if (m) return m[1];
-  } catch {}
-  const href = await page.evaluate(()=>{ const a=document.querySelector('a[href*="/file/d/"]'); return a?a.getAttribute('href'):null; }).catch(()=>null);
-  const m = href && href.match(/\/file\/d\/([^/]+)/);
-  return (m && m[1]) || null;
-}
-
-/* (opcional) compartir → cualquiera con enlace (lector) */
-async function makeAnyoneWithLinkViewer(page, row) {
-  await row.click({ button: 'right' }).catch(()=>{});
-  const shareBtn = page.locator([
-    'div[role="menuitem"]:has-text("Compartir")',
-    'div[role="menuitem"]:has-text("Share")',
-    '[aria-label="Compartir"]',
-  ].join(', ')).first();
-  try { await shareBtn.waitFor({ state: 'visible', timeout: 5000 }); await shareBtn.click(); } catch {
-    const topShare = page.locator('div[aria-label="Compartir"], div[aria-label="Share"]').first();
-    await topShare.click().catch(()=>{});
-  }
-  const accessBtn = page.locator('button:has-text("Restringido"), div[role="button"]:has-text("Restringido"), button:has-text("Restricted"), div[role="button"]:has-text("Restricted")').first();
-  if (await accessBtn.count()) await accessBtn.click().catch(()=>{});
-  const anyoneItem = page.locator('div[role="menuitem"]:has-text("Cualquier persona con el enlace"), div[role="menuitem"]:has-text("Anyone with the link")').first();
-  if (await anyoneItem.count()) await anyoneItem.click().catch(()=>{});
-  const roleBtn = page.locator('div[role="button"]:has-text("Lector"), div[role="button"]:has-text("Viewer")').first();
-  if (await roleBtn.count()) await roleBtn.click().catch(()=>{});
-  const roleViewer = page.locator('div[role="menuitem"]:has-text("Lector"), div[role="menuitem"]:has-text("Viewer")').first();
-  if (await roleViewer.count()) await roleViewer.click().catch(()=>{});
-  const copyBtn = page.locator('button:has-text("Copiar enlace"), button:has-text("Copy link")').first();
-  let link = null;
-  if (await copyBtn.count()) {
-    await copyBtn.click().catch(()=>{});
-    link = await page.locator('input[aria-label*="Enlace"], input[type="text"]').first().inputValue().catch(()=>null);
-  }
-  await page.keyboard.press('Escape').catch(()=>{});
-  return link;
-}
-
-/* === utilidades de verificación ligera === */
+/* ================== VERIFICACIONES / SHARE ================== */
 async function getDisplayedNameFromRow(page, row) {
-  // Intenta leer un aria-label o texto cercano para devolver el nombre tal como lo pinta Drive
   try {
     const name = await row.evaluate((el) => {
+      // nombre fuerte
+      const strong = el.querySelector('strong.DNoYtb');
+      if (strong) return strong.textContent.trim();
+      // aria-label o texto de celda
       const attrName = el.getAttribute('aria-label') || '';
       if (attrName) return attrName;
-      // Buscar texto de una celda hija
-      const cell = el.querySelector('[role="gridcell"], [aria-label]');
-      return (cell && (cell.getAttribute('aria-label') || cell.textContent || '')).trim();
+      const cell = el.querySelector('[role="gridcell"][aria-label]');
+      if (cell) return (cell.getAttribute('aria-label') || '').trim();
+      return (el.innerText || '').trim();
     });
     return (name || '').trim();
   } catch { return null; }
@@ -469,10 +453,36 @@ async function verifyInRecents(page, name, timeoutMs = 8000) {
   } catch {}
   return false;
 }
+async function makeAnyoneWithLinkViewer(page, row) {
+  await row.click({ button: 'right' }).catch(()=>{});
+  const shareBtn = page.locator([
+    'div[role="menuitem"]:has-text("Compartir")',
+    'div[role="menuitem"]:has-text("Share")',
+    '[aria-label="Compartir"]',
+  ].join(', ')).first();
+  try { await shareBtn.waitFor({ state: 'visible', timeout: 5000 }); await shareBtn.click(); } catch {
+    const topShare = page.locator('div[aria-label="Compartir"], div[aria-label="Share"]').first();
+    await topShare.click().catch(()=>{});
+  }
+  const accessBtn = page.locator('div[role="button"]:has-text("Restringido"), div[role="button"]:has-text("Restricted")').first();
+  if (await accessBtn.count()) await accessBtn.click().catch(()=>{});
+  const anyoneItem = page.locator('div[role="menuitem"]:has-text("Cualquier persona con el enlace"), div[role="menuitem"]:has-text("Anyone with the link")').first();
+  if (await anyoneItem.count()) await anyoneItem.click().catch(()=>{});
+  const roleBtn = page.locator('div[role="button"]:has-text("Lector"), div[role="button"]:has-text("Viewer")').first();
+  if (await roleBtn.count()) await roleBtn.click().catch(()=>{});
+  const roleViewer = page.locator('div[role="menuitem"]:has-text("Lector"), div[role="menuitem"]:has-text("Viewer")').first();
+  if (await roleViewer.count()) await roleViewer.click().catch(()=>{});
+  const copyBtn = page.locator('button:has-text("Copiar enlace"), button:has-text("Copy link")').first();
+  let link = null;
+  if (await copyBtn.count()) {
+    await copyBtn.click().catch(()=>{});
+    link = await page.locator('input[aria-label*="Enlace"], input[type="text"]').first().inputValue().catch(()=>null);
+  }
+  await page.keyboard.press('Escape').catch(()=>{});
+  return link;
+}
 
-/* ========================================================================== */
-/* ======================== SUBIR ARCHIVO (UI) ============================== */
-/* ========================================================================== */
+/* ================== SUBIR ARCHIVO (UI) ================== */
 async function uploadFileToSpecificFolderUI(filePath) {
   if (!fs.existsSync(filePath)) throw new Error(`Archivo no existe: ${filePath}`);
 
@@ -535,40 +545,38 @@ async function uploadFileToSpecificFolderUI(filePath) {
     if (!uploaded) throw new Error('No se pudo iniciar la subida tras varios intentos.');
     if (!DELETE_BEFORE_UPLOAD) await handleUploadConflictDialog(page, 8000).catch(()=>{});
 
-    // ✅ ESPERA ROBUSTA Y **RETURN RÁPIDO** TRAS VER LA FILA
-    const row = await waitForUploadFinishRobust(page, desiredName, 5 * 60 * 1000);
-    console.log('✅ Subida detectada y fila localizada');
+    // === ESPERA ESTRICTA: detectar realmente la fila del grid (<tr data-id>) ===
+    const { fileId, row } = await waitForFileRowByDataIdOrName(page, desiredName, 5 * 60 * 1000);
+    console.log('✅ Subida detectada y fila localizada. fileId =', fileId);
 
-    // Leer nombre mostrado en UI (mejora de verificación) — best effort
     const displayedName = (await getDisplayedNameFromRow(page, row).catch(()=>null)) || desiredName;
 
-    // (Opcional) doble verificación en “Recientes”
-    let verifyMethod = 'row';
+    // (Opcional) verificación secundaria en “Recientes”
+    let verifyMethod = 'tr[data-id]';
     try {
       const alsoInRecents = await verifyInRecents(page, desiredName).catch(()=>false);
-      if (alsoInRecents) verifyMethod = 'row+recents';
+      if (alsoInRecents) verifyMethod = 'tr[data-id]+recents';
     } catch {}
 
-    const fastResult = {
+    // (Opcional) hacer público y obtener link
+    let shareLink = null;
+    if (MAKE_LINK_PUBLIC) {
+      try { shareLink = await makeAnyoneWithLinkViewer(page, row); } catch {}
+    }
+
+    const result = {
       ok: true,
       name: desiredName,
-      displayedName,          // cómo lo ve la UI
+      displayedName,
       verified: true,
-      verifyMethod,           // 'row' o 'row+recents'
-      id: null,
-      webViewLink: null,
-      webContentLink: null,
-      shareLink: null
+      verifyMethod,
+      id: fileId,
+      webViewLink: `https://drive.google.com/file/d/${fileId}/view`,
+      webContentLink: `https://drive.google.com/uc?export=download&id=${fileId}`,
+      shareLink
     };
-    console.log('🏁 Final (fast return):', fastResult);
-    return fastResult;
-
-    // --- NOTA ---
-    // Si en algún momento vuelves a necesitar el fileId, puedes
-    // sustituir el bloque anterior por la lógica “lenta”:
-    // const fileId = await getFileIdFromDetails(page, row).catch(()=>null);
-    // ... construir enlaces y devolverlos.
-    // ----------------
+    console.log('🏁 Final:', result);
+    return result;
 
   } finally {
     try { await context.close(); } catch {}

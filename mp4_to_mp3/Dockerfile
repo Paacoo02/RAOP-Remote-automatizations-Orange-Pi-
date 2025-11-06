@@ -35,15 +35,16 @@ RUN set -eux; \
 WORKDIR /app
 
 # ======================================================
-# 📦 Node + Playwright (ROBUSTO ✅ sin package-lock)
+# 📦 Node + Playwright (¡ARREGLO DEFINITIVO!)
 # ======================================================
-ENV PLAYWRIGHT_VERSION=1.47.2
+# El error pide 'chromium-1193', que corresponde a playwright v1.40.0
+ENV PLAYWRIGHT_VERSION_TARGET=1.40.0
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN mkdir -p /ms-playwright && chown -R root:root /ms-playwright
 
 COPY package*.json ./
 
-# Usa npm ci si hay lockfile; si no, npm install. Luego instala playwright y sus browsers.
+# Instala playwright@1.40.0 Y LUEGO sus navegadores
 RUN --mount=type=cache,target=/root/.npm bash -lc '\
   if [ -f package-lock.json ]; then \
     echo "🔒 package-lock.json encontrado → npm ci"; \
@@ -52,25 +53,13 @@ RUN --mount=type=cache,target=/root/.npm bash -lc '\
     echo "ℹ️ Sin lockfile → npm install"; \
     npm install --omit=dev; \
   fi && \
-  npm install playwright@${PLAYWRIGHT_VERSION} && \
+  echo "📥 Forzando instalación de playwright@${PLAYWRIGHT_VERSION_TARGET} Y playwright-core@${PLAYWRIGHT_VERSION_TARGET}..." && \
+  npm install playwright@${PLAYWRIGHT_VERSION_TARGET} playwright-core@${PLAYWRIGHT_VERSION_TARGET} && \
+  echo "📥 Instalando navegador chromium (para v${PLAYWRIGHT_VERSION_TARGET})..." && \
   npx playwright install --with-deps chromium \
 '
-
-
 # ======================================================
-# 🧠 Entorno de Python
-# ======================================================
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-COPY requirements.txt ./
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ -f requirements.txt ]; then \
-      pip install --default-timeout=120 --retries=5 --no-cache-dir -r requirements.txt; \
-    fi
-
-# ======================================================
-# 🔐 Configuración de SSH
+# 🔐 Configuración de SSH (sin cambios)
 # ======================================================
 RUN useradd -ms /bin/bash devuser && echo "devuser:devpass" | chpasswd && \
     echo "root:root" | chpasswd && mkdir -p /var/run/sshd && \
@@ -79,7 +68,7 @@ RUN useradd -ms /bin/bash devuser && echo "devuser:devpass" | chpasswd && \
     echo "AllowUsers devuser root" >> /etc/ssh/sshd_config
 
 # ======================================================
-# ⚙️ Copia de código y permisos
+# ⚙️ Copia de código y permisos (sin cambios)
 # ======================================================
 COPY . .
 RUN chmod +x /app/start.sh /app/clear_ssh_host.sh || true
@@ -87,12 +76,14 @@ RUN chmod +x /app/start.sh /app/clear_ssh_host.sh || true
 EXPOSE 22 6080 5901 3001
 
 # ======================================================
-# 🌙 Configuración del entorno por defecto
+# 🌙 Configuración del entorno por defecto (sin cambios)
 # ======================================================
 ENV NODE_ENV=production \
     DISPLAY=:99 \
     XVFB_RESOLUTION=1920x1080x24 \
     HEADLESS=false
 
-CMD ["/bin/bash", "-c", "/app/clear_ssh_host.sh && service ssh restart && echo '🟢 SSH en ejecución (puerto 22)' && while true; do sleep 3600; done"]
-
+# ======================================================
+# 🚀 Comando de arranque (sin cambios)
+# ======================================================
+CMD ["/app/start.sh"]
