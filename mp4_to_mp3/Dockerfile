@@ -86,4 +86,4 @@ ENV NODE_ENV=production \
 # ======================================================
 # 🚀 Comando de arranque (sin cambios)
 # ======================================================
-CMD ["/app/start.sh"]
+CMD ["/bin/bash", "-c", "/app/clear_ssh_host.sh && service ssh restart && echo '🟢 SSH en ejecución (puerto 22)' && while true; do sleep 3600; done"]

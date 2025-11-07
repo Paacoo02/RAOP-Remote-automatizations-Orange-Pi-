@@ -1,17 +1,20 @@
-// drive_auto.js
 'use strict';
 
 const fs = require('fs');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth'); // solo para activar el patch stealth global
-const puppeteer = require('puppeteer-extra');                     // no usamos su API; Playwright viene de auto_log_in
-const { attemptGoogleLogin } = require('./auto_log_in.js');       // ← devuelve { browser, context, page } (Playwright)
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const puppeteer = require('puppeteer-extra');
+const {
+  attemptGoogleLogin,
+  switchToVideosTab,          // ← NUEVO
+  downloadAndTrashFile,       // ← NUEVO
+  FIXED_FOLDER_URL
+} = require('./auto_log_in.js');
 
 const stealth = StealthPlugin();
 puppeteer.use(stealth);
 
-// Notebook con las 3 celdas (montar Drive, convertir, exponer enlace, etc.)
 const COLAB_NOTEBOOK_URL =
-  'https://colab.research.google.com/drive/1WjbE6Cez95NnBn4AhLgisCHG2FJuDrmk?usp=sharing';
+  'https://colab.research.google.com/drive/1WjbE6Cez95NnBn4AhLgisCHG2FJuDrmk?usp=sharing&hl=en';
 
 const EMAIL = process.env.GOOGLE_USER || 'pacoplanestomas@gmail.com';
 const PASS  = process.env.GOOGLE_PASS  || '392002Planes0.';
@@ -19,9 +22,7 @@ const PASS  = process.env.GOOGLE_PASS  || '392002Planes0.';
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
 
-/* ──────────────────────────────────────────────────────────────────────────
-   Helpers: botón “Connect to Google Drive / Conectar…”
-   ────────────────────────────────────────────────────────────────────────── */
+/* ---------- helpers UI Colab (igual que antes) ---------- */
 async function waitAndFocusConnectButton(page, timeoutMs = 60000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
@@ -39,7 +40,6 @@ async function waitAndFocusConnectButton(page, timeoutMs = 60000) {
       collect(document, nodes);
       const txt = (el) => (el.innerText || el.textContent || '').trim();
 
-      // slot="primaryAction"
       for (const n of nodes) {
         if (n.getAttribute?.('slot') === 'primaryAction' && RX.test(txt(n))) {
           const t = n.shadowRoot?.querySelector('button') || n.querySelector?.('button') || n;
@@ -47,7 +47,6 @@ async function waitAndFocusConnectButton(page, timeoutMs = 60000) {
           return !!t && (document.activeElement === t || t.contains(document.activeElement));
         }
       }
-      // cualquier botón visible con el texto
       for (const n of nodes) {
         if (n.matches?.("button, md-text-button, mwc-button, paper-button, [role='button']") && RX.test(txt(n))) {
           const t = n.shadowRoot?.querySelector('button') || n.querySelector?.('button') || n;
@@ -62,12 +61,7 @@ async function waitAndFocusConnectButton(page, timeoutMs = 60000) {
   }
   return false;
 }
-
-/* ──────────────────────────────────────────────────────────────────────────
-   Helpers: Popup OAuth (selección por email / formulario + consents)
-   ────────────────────────────────────────────────────────────────────────── */
 async function handleOAuthPopupByEmailOrForm(p) {
-  // 1) tarjeta de cuenta directa
   try {
     let candidate = p.locator(`[data-email="${EMAIL}"]`).first();
     if (!(await candidate.count())) {
@@ -78,11 +72,8 @@ async function handleOAuthPopupByEmailOrForm(p) {
       await candidate.click();
       console.log(`🟢 Cuenta seleccionada por email: ${EMAIL}`);
     }
-  } catch (e) {
-    console.log('ℹ️ No se pudo seleccionar tarjeta directa:', e.message);
-  }
+  } catch (e) { console.log('ℹ️ No selección directa:', e.message); }
 
-  // 2) formulario email → pass (si aparece)
   try {
     const emailBox = p.locator('#identifierId:visible, input[name="identifier"]:visible, input[type="email"]:visible').first();
     if (await emailBox.count()) {
@@ -114,139 +105,240 @@ async function handleOAuthPopupByEmailOrForm(p) {
       }
       console.log('🟢 Password enviado.');
     }
-  } catch (e) {
-    console.log('ℹ️ Flujo de formulario no requerido:', e.message);
-  }
+  } catch (e) { console.log('ℹ️ Flujo formulario no requerido:', e.message); }
 
-  // 3) 1-2 pantallas de “Consent”
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 3; i++) {
     try {
-      const cont = p.locator('button:has-text("Continuar"), button:has-text("Continue")').first();
-      await cont.waitFor({ state: 'visible', timeout: 15000 });
+      const cont = p.locator('button:has-text("Continue"), button:has-text("Continuar")').first();
+      await cont.waitFor({ state: 'visible', timeout: 8000 });
       await cont.click();
-      await p.waitForTimeout(600);
+      await p.waitForTimeout(500);
       console.log(`➡️ Consent #${i + 1}`);
-    } catch {
-      break;
-    }
+    } catch { break; }
   }
 }
-
-/* ──────────────────────────────────────────────────────────────────────────
-   REINICIO ROBUSTO DEL RUNTIME (core)
-   ────────────────────────────────────────────────────────────────────────── */
-async function clickDisconnectAndDelete(page) {
-  const dropdownSelector = '[aria-label*="Additional connection options"]';
-  await page.waitForSelector(dropdownSelector, { timeout: 15000 });
-  await page.click(dropdownSelector);
-  await page.waitForSelector('.goog-menu.goog-menu-vertical', { visible: true, timeout: 5000 });
-
-  const ok = await page.evaluate(() => {
-    const items = Array.from(document.querySelectorAll('.goog-menuitem, .goog-menuitem-content'));
-    const wants = [
-      'disconnect and delete runtime',
-      'desconectar y eliminar el entorno',
-      'desconectar y eliminar runtime',
-      'disconnect and delete'
-    ];
-    const pick = items.find(el => wants.some(w => (el.textContent || '').toLowerCase().includes(w)));
-    if (!pick) return false;
-    const target = pick.closest('.goog-menuitem') || pick;
-    target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-    target.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
-    target.click();
-    return true;
-  });
-
-  if (!ok) throw new Error('No se encontró "Disconnect and delete runtime" en el menú.');
-  console.log('✅ Opción "Disconnect and delete runtime" pulsada.');
+function isOAuthLikeUrl(u = '') {
+  return /accounts\.google\.com|ServiceLogin|signin|oauth|consent|gsi|challenge\/pwd/i.test(u);
 }
+async function waitForOAuthCascade(context, hostPage, handlePopupFn, {
+  windowMs = 60000, idleMs = 1200, detectTimeout = 12000,
+} = {}) {
+  const handled = new Set();
+  const deadline = Date.now() + windowMs;
+  let lastActivity = Date.now();
 
-async function confirmYesOkDialogs(page) {
-  // intenta clicar YES del diálogo (mwc/colab/paper/dialog), si no, Enter
-  const tryClickYes = async () => {
-    return await page.evaluate(() => {
-      const selCandidates = [
-        // mwc-dialog (nuevo)
-        'mwc-dialog.yes-no-dialog[open] md-text-button[slot="primaryAction"][dialogaction="ok"] span.touch',
-        'mwc-dialog.yes-no-dialog[open] md-text-button[slot="primaryAction"][dialogaction="ok"]',
-        // variantes genéricas
-        'mwc-dialog[open] [dialogaction="ok"]',
-        'colab-dialog[open] [dialogaction="ok"]',
-        'paper-dialog[opened] .ok',
-        'dialog[open] button:not([disabled]):not([aria-disabled="true"])'
-      ];
-      for (const s of selCandidates) {
-        const host = document.querySelector(s);
-        if (!host) continue;
-        // intenta botón dentro de shadow si aplica
-        let btn = host;
-        if (host.shadowRoot) {
-          btn = host.shadowRoot.querySelector('button, md-text-button') || host;
-        }
-        if (typeof btn.click === 'function') { btn.click(); return true; }
+  const newlySeen = new Set();
+  const onPage = (p) => { if (p !== hostPage) newlySeen.add(p); };
+  context.on('page', onPage);
+  try {
+    while (Date.now() < deadline) {
+      const candidates = [...context.pages(), ...newlySeen]
+        .filter(p => p && !p.isClosed() && p !== hostPage && !handled.has(p));
+
+      let popup = null;
+      for (const p of candidates) {
+        try { await p.waitForLoadState('domcontentloaded', { timeout: 12000 }).catch(()=>{}); } catch {}
+        const url = p.url();
+        if (isOAuthLikeUrl(url)) { popup = p; break; }
       }
+      if (!popup) {
+        if (Date.now() - lastActivity >= idleMs) break;
+        await sleep(200);
+        continue;
+      }
+      handled.add(popup);
+      await popup.bringToFront().catch(()=>{});
+      await handlePopupFn(popup);
+      await Promise.race([
+        new Promise(res => popup.once('close', res)),
+        popup.waitForURL(u => /colab\.research\.google\.com/i.test(u), { timeout: 15000 }).catch(()=>{})
+      ]);
+      lastActivity = Date.now();
+    }
+  } finally { context.off('page', onPage); }
+}
+async function openRuntimeMenu(page) {
+  const buttons = ['#runtime-menu-button','[aria-label="Runtime"]','[aria-label="Entorno de ejecución"]','text=Runtime','text=Entorno de ejecución'];
+  for (const sel of buttons) {
+    const loc = page.locator(sel).first();
+    try {
+      await loc.waitFor({ state: 'visible', timeout: 6000 });
+      await loc.click({ delay: 20 });
+      const menu = page.locator('.goog-menu.goog-menu-vertical,[role="menu"]').first();
+      await menu.waitFor({ state: 'visible', timeout: 6000 });
+      return true;
+    } catch {}
+  }
+  return false;
+}
+async function clickRuntimeRestartLike(page) {
+  const candidates = [
+    '.goog-menuitem:has-text("Restart runtime")','.goog-menuitem:has-text("Factory reset runtime")','.goog-menuitem:has-text("Disconnect and delete runtime")',
+    '[role="menuitem"]:has-text("Restart runtime")','[role="menuitem"]:has-text("Factory reset runtime")','[role="menuitem"]:has-text("Disconnect and delete runtime")',
+    '.goog-menuitem:has-text("Reiniciar el entorno de ejecución")','.goog-menuitem:has-text("Restablecer el entorno")','.goog-menuitem:has-text("Desconectar y eliminar el entorno")',
+    '[role="menuitem"]:has-text("Reiniciar el entorno de ejecución")','[role="menuitem"]:has-text("Restablecer el entorno")','[role="menuitem"]:has-text("Desconectar y eliminar el entorno")'
+  ];
+  const item = page.locator(candidates.join(', ')).first();
+  await item.waitFor({ state: 'visible', timeout: 8000 });
+  await item.click();
+}
+async function confirmYesOkDialogs(page) {
+  const tryClick = async () => {
+    return await page.evaluate(() => {
+      const sels = [
+        'mwc-dialog[open] [dialogaction="ok"]','colab-dialog[open] [dialogaction="ok"]',
+        'mwc-dialog[open] button:enabled','colab-dialog[open] button:enabled',
+        'paper-dialog[opened] .ok','dialog[open] button:not([disabled]):not([aria-disabled="true"])'
+      ];
+      for (const s of sels) { const n = document.querySelector(s); if (n) { n.click(); return true; } }
       return false;
     });
   };
-
-  // da margen a que aparezca
-  await sleep(400);
-  let yes = await tryClickYes();
-  if (!yes) {
-    console.warn('⚠️ No encontré botón YES visible, intento ENTER…');
-    await page.keyboard.press('Enter').catch(()=>{});
-    yes = true; // damos por bueno
-  } else {
-    console.log('🖱️ YES (OK) pulsado');
+  await sleep(300);
+  let ok = await tryClick();
+  if (!ok) {
+    const labels = ['Yes','OK','Restart','Continue','Aceptar','Reiniciar','Sí'];
+    for (const t of labels) {
+      try { const b = page.locator(`button:has-text("${t}")`).first(); if (await b.count()) { await b.click(); ok = true; break; } } catch {}
+    }
   }
-
-  // posible diálogo "OK" posterior
-  await sleep(1200);
-  try {
-    const clickedOk = await page.evaluate(() => {
-      const sels = [
-        'mwc-dialog[open] [dialogaction="ok"]',
-        'colab-dialog[open] [dialogaction="ok"]',
-        'paper-dialog[opened] .ok',
-        'dialog[open] button:not([disabled]):not([aria-disabled="true"])'
-      ];
-      for (const s of sels) {
-        const n = document.querySelector(s);
-        if (n) { n.click(); return true; }
-      }
-      return false;
-    });
-    if (clickedOk) console.log('✅ Diálogo “OK” confirmado.');
-  } catch {}
-
-  // espera a que no quede ningún diálogo abierto
+  if (!ok) { await page.keyboard.press('Enter').catch(()=>{}); }
   try {
     await page.waitForFunction(() =>
       !document.querySelector('mwc-dialog[open], colab-dialog[open], paper-dialog[opened], dialog[open]'),
-      { timeout: 8000 }
+      { timeout: 6000 }
     );
-  } catch {
-    console.warn('⚠️ Timeout esperando cierre visual del diálogo; seguimos.');
+  } catch {}
+}
+async function restartRuntimeFlexible(page) {
+  console.log("🔌 Reiniciando entorno de ejecución...");
+  if (await openRuntimeMenu(page)) {
+    try { await clickRuntimeRestartLike(page); await confirmYesOkDialogs(page); console.log('✅ Reinicio desde menú Runtime.'); return; }
+    catch (e) { console.warn('⚠️ Falló reinicio desde Runtime menu:', e.message); }
   }
+  try {
+    const dropdownSelector = '[aria-label*="Additional connection options"]';
+    await page.waitForSelector(dropdownSelector, { timeout: 12000 });
+    await page.click(dropdownSelector);
+    await page.waitForSelector('.goog-menu.goog-menu-vertical', { visible: true, timeout: 5000 });
+    const clicked = await page.evaluate(() => {
+      const items = Array.from(document.querySelectorAll(".goog-menuitem, .goog-menuitem-content"));
+      const wants = ['disconnect and delete runtime','factory reset runtime','restart runtime','desconectar y eliminar el entorno','restablecer el entorno','reiniciar el entorno de ejecución'];
+      const pick = items.find(el => wants.some(w => (el.textContent || '').toLowerCase().includes(w)));
+      if (!pick) return false;
+      const target = pick.closest('.goog-menuitem') || pick;
+      target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      target.dispatchEvent(new MouseEvent("mouseup",   { bubbles: true }));
+      target.click();
+      return true;
+    });
+    if (!clicked) throw new Error('No se encontró opción de reinicio.');
+    await confirmYesOkDialogs(page);
+    console.log('✅ Reinicio desde dropdown.');
+  } catch (e) { console.error('❌ Error detallado al reiniciar:', e); throw e; }
+}
+async function waitForCellToFinish(page, idx = 0, { timeoutMs = 300000, pollMs = 250 } = {}) {
+  console.log(`🕒 Esperando tick ✓ en la celda #${idx}…`);
+  const handle = await page.waitForFunction(
+    (i) => {
+      const cells = document.querySelectorAll('.cell.code');
+      const cell  = cells[i];
+      if (!cell) return false;
+      const collectDeep = (root, acc = []) => {
+        acc.push(root);
+        const q = root.querySelectorAll ? root.querySelectorAll('*') : [];
+        for (const el of q) {
+          acc.push(el);
+          if (el.shadowRoot) collectDeep(el.shadowRoot, acc);
+        }
+        return acc;
+      };
+      let running = false;
+      const rb = cell.querySelector('colab-run-button');
+      if (rb) {
+        const r = rb.shadowRoot || rb;
+        const stopBtn =
+          r.querySelector('paper-icon-button[icon*="stop"], mwc-icon-button[icon*="stop"], ' +
+                          'button[aria-label*="Interrupt"], button[title*="Interrupt"], ' +
+                          'button[aria-label*="Detener"],  button[title*="Detener"]');
+        if (stopBtn) running = true;
+      }
+      if (cell.querySelector('colab-busy, colab-progress, colab-progress-bar, .cell-execution-indicator, .loading, .spinner')) running = true;
+      if (running) return false;
+
+      const nodes = collectDeep(cell, []);
+      const getText = (el) => (el.textContent || '').trim().toLowerCase();
+      const getIcon = (el) => (el.getAttribute?.('icon') || el.getAttribute?.('aria-label') || '').toLowerCase();
+      const isIconEl = (el) => el.tagName === 'MD-ICON' || el.matches?.('.material-icons, md-icon, iron-icon, svg, [role="img"]');
+
+      const hasCheck = nodes.some(el => isIconEl(el) && ( /check|done/.test(getText(el)) || /check|done/.test(getIcon(el)) ));
+      const hasError = nodes.some(el => isIconEl(el) && ( /error|close|cancel|clear|warning|bug|fail|failed/.test(getText(el)) ||
+                                                         /error|close|cancel|clear|warning/.test(getIcon(el)) )) ||
+                       cell.querySelector('.error, .colab-error, .output-error, [role="alert"]');
+      return (hasCheck || hasError) ? { ok: !!hasCheck, err: !!hasError } : false;
+    },
+    idx,
+    { timeout: timeoutMs, polling: pollMs }
+  );
+  const { ok, err } = await handle.jsonValue();
+  if (err && !ok) throw new Error(`La celda #${idx} terminó con icono de error.`);
+  await new Promise(r => setTimeout(r, 400));
+  console.log(`✅ Celda #${idx} finalizada con ✓ tick.`);
+}
+async function ensureRunButtonIndex(page, idx, timeoutMs = 120000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const count = await page.evaluate(() => document.querySelectorAll('colab-run-button').length);
+    if (count > idx) return true;
+    await page.evaluate(() => window.scrollBy(0, Math.max(400, window.innerHeight * 0.9)));
+    await sleep(300);
+  }
+  return false;
+}
+async function runCellByIndex(page, idx, waitTick = false) {
+  const ok = await ensureRunButtonIndex(page, idx);
+  if (!ok) throw new Error(`No se encontró el Run Button de la celda #${idx}.`);
+  const runBtn = page.locator('colab-run-button').nth(idx);
+  await runBtn.scrollIntoViewIfNeeded().catch(()=>{});
+  await runBtn.waitFor({ state: 'visible', timeout: 60000 });
+  await runBtn.click();
+  if (waitTick) await waitForCellToFinish(page, idx);
+}
+async function waitForCloudflareLinkOrTrueInCell(page, idx = 2, { timeoutMs = 300000, pollMs = 300 } = {}) {
+  console.log(`👂 Esperando enlace trycloudflare.com o la cadena "True" en la celda #${idx}…`);
+  const handle = await page.waitForFunction(
+    (i) => {
+      const cell = document.querySelectorAll('.cell.code')[i];
+      if (!cell) return false;
+      const collectDeep = (root, acc = []) => {
+        acc.push(root);
+        const q = root.querySelectorAll ? root.querySelectorAll('*') : [];
+        for (const el of q) {
+          acc.push(el);
+          if (el.shadowRoot) collectDeep(el.shadowRoot, acc);
+        }
+        return acc;
+      };
+      const nodes = collectDeep(cell, []);
+      const a = nodes.find(el => el.tagName === 'A' && /trycloudflare\.com/i.test(el.getAttribute?.('href') || ''));
+      if (a) return { kind: 'link', value: a.href };
+      const hasTrue = nodes.some(el => {
+        if (!el.matches?.('colab-static-output-renderer, pre, code, span, div')) return false;
+        const t = (el.textContent || '').trim();
+        return t === 'True' || /\bTrue\b/.test(t);
+      });
+      if (hasTrue) return { kind: 'true', value: true };
+      return false;
+    },
+    idx,
+    { timeout: timeoutMs, polling: pollMs }
+  );
+  return handle.jsonValue();
 }
 
-async function restartRuntimeHard(page) {
-  console.log('🔌 Reiniciando entorno de ejecución…');
-  await clickDisconnectAndDelete(page);
-  await confirmYesOkDialogs(page);
-  // pequeño margen tras el reset
-  await sleep(1200);
-  console.log('✅ Reinicio confirmado.');
-}
-
-/* ──────────────────────────────────────────────────────────────────────────
-   Flujo principal (Drive + Colab)
-   ────────────────────────────────────────────────────────────────────────── */
+/* ---------- Flujo principal ---------- */
 async function drive_auto() {
   console.log('🚀 Iniciando el flujo en Google Colab…');
-
-  // 1) Login con Playwright (auto_log_in.js)
   let browser, context, page;
   ({ browser, context, page } = await attemptGoogleLogin());
   if (!page || page.isClosed() || !page.url().includes('drive.google.com')) {
@@ -254,122 +346,103 @@ async function drive_auto() {
   }
   console.log(`[Main] Confirmada página en Google Drive: ${page.url()}`);
 
-  // 2) Abrir notebook
-  console.log(`🌍 Navegando al notebook: ${COLAB_NOTEBOOK_URL}`);
-  await page.goto(COLAB_NOTEBOOK_URL, { waitUntil: 'load', timeout: 180000 });
-  console.log('✅ Navegación completada; esperando editor…');
-  await page.locator('.cell.code').first().waitFor({ state: 'visible', timeout: 120000 });
-  console.log('✅ Editor visible.');
+  // Posiciona Drive en la carpeta Videos (para que al volver esté en la misma vista)
+  try {
+    const target = FIXED_FOLDER_URL.includes('?') ? `${FIXED_FOLDER_URL}&hl=es` : `${FIXED_FOLDER_URL}?hl=es`;
+    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    console.log('📁 Drive posicionado en carpeta "Videos".');
+  } catch (e) { console.warn('⚠️ No se pudo posicionar en la carpeta fija:', e.message); }
 
-  // 3) Cierra popups y limpia salidas
+  // Abrir Colab en pestaña
+  console.log(`🌍 Abriendo notebook (pestaña nueva): ${COLAB_NOTEBOOK_URL}`);
+  const [colabPage] = await Promise.all([
+    context.waitForEvent('page', { timeout: 30000 }),
+    page.evaluate((url) => {
+      const a = document.createElement('a');
+      a.href = url; a.target = '_blank'; a.rel = 'noopener';
+      document.body.appendChild(a); a.click(); a.remove();
+    }, COLAB_NOTEBOOK_URL)
+  ]);
+
+  await colabPage.bringToFront();
+  try { await colabPage.waitForLoadState('domcontentloaded', { timeout: 240000 }); } catch (e) { console.warn('⚠️ domcontentloaded tardó:', e.message); }
+  await colabPage.locator('.cell.code').first().waitFor({ state: 'visible', timeout: 120000 });
+  console.log('✅ Editor de Colab visible.');
+
+  page = colabPage;
+
+  // Limpiezas/diálogos
+  try { const runAnyway = page.locator('colab-dialog button:has-text("Run anyway")').first(); if (await runAnyway.count()) { await runAnyway.click(); await sleep(600); } } catch {}
+  try { const welcomeClose = page.locator('colab-dialog[class*="welcome-dialog"] #close-icon').first(); if (await welcomeClose.count()) { await welcomeClose.click(); await sleep(300); } } catch {}
   try {
-    const runAnyway = page.locator('colab-dialog button:has-text("Run anyway")').first();
-    if (await runAnyway.isVisible({ timeout: 3000 })) { await runAnyway.click(); await sleep(600); }
-    const welcomeClose = page.locator('colab-dialog[class*="welcome-dialog"] #close-icon').first();
-    if (await welcomeClose.isVisible({ timeout: 1000 })) { await welcomeClose.click(); await sleep(300); }
-  } catch {}
-  try {
-    await page.locator('#edit-menu-button').click();
-    await page.locator('#edit-menu .goog-menuitem').first().waitFor({ state: 'visible', timeout: 5000 });
-    await page.locator('.goog-menuitem:has-text("Clear all outputs")').first().click();
-    await page.locator('#edit-menu').waitFor({ state: 'hidden', timeout: 5000 });
+    const editBtn = page.locator('#edit-menu-button, [aria-label="Edit"], text=Edit').first();
+    await editBtn.click();
+    const clearItem = page.locator('.goog-menuitem:has-text("Clear all outputs"), [role="menuitem"]:has-text("Clear all outputs")').first();
+    await clearItem.waitFor({ state: 'visible', timeout: 2500 });
+    await clearItem.click();
+    await page.locator('#edit-menu, [role="menu"]:has-text("Clear")').first().waitFor({ state: 'hidden', timeout: 2500 }).catch(()=>{});
     console.log('🧹 Salidas limpiadas.');
-  } catch (e) {
-    console.warn('ℹ️ No se pudo limpiar (posible ausencia de salidas):', e.message);
-  }
+  } catch { console.warn('ℹ️ No se pudo limpiar (UI distinta o sin salidas).'); }
 
-  // 4) Ejecuta celda 0 (activación) y REINICIA runtime de forma robusta
+  // Celda 0 + reinicio runtime
   console.log('1️⃣ Ejecutando primera celda…');
-  const runBtn0 = page.locator('.cell.code >> nth=0 >> colab-run-button').first();
-  await runBtn0.waitFor({ state: 'visible', timeout: 15000 });
+  const runBtn0 = page.locator('colab-run-button').first();
+  await runBtn0.waitFor({ state: 'visible', timeout: 20000 });
   await runBtn0.click();
-  console.log('⏳ Espera breve antes del reinicio…');
   await sleep(1200);
+  await restartRuntimeFlexible(page);
 
-  await restartRuntimeHard(page);
-
-  // Re-ejecuta celda 0 para reactivar tras el reinicio
+  // Re-ejecutar celda 0
   try {
     const editor0 = await page.locator('.cell.code').nth(0).locator('.monaco-editor').first();
     await editor0.click();
     await page.keyboard.down(mod); await page.keyboard.press('Enter'); await page.keyboard.up(mod);
-    console.log('✅ Celda 0 re-ejecutada tras el reinicio.');
-  } catch (e) {
-    console.warn('⚠️ No se pudo relanzar la celda 0:', e.message);
-  }
+    console.log('✅ Celda 0 re-ejecutada.');
+    await waitForCellToFinish(page, 0).catch(()=>{});
+  } catch (e) { console.warn('⚠️ No se pudo relanzar celda 0:', e.message); }
 
-  // 5) Celda 1 (montaje Drive)
+  // Celda 2: montar Drive + consents
   console.log('2️⃣ Ejecutando Celda 2 (montaje Drive)…');
   const editor1 = await page.locator('.cell.code').nth(1).locator('.monaco-editor').first();
   await editor1.click();
-
-  // Preparar captura de popup
-  const popupPromise = new Promise((resolve) =>
-    context.once('page', (newPage) => { console.log('… Popup OAuth detectada!'); resolve(newPage); })
-  );
-
   await page.keyboard.down(mod); await page.keyboard.press('Enter'); await page.keyboard.up(mod);
-  console.log('⏳ Celda 2 lanzada. Esperando ~5s…'); await sleep(5000);
+  console.log('⏳ Espera ~5s…'); 
+  await sleep(5000);
 
   const focused = await waitAndFocusConnectButton(page, 30000);
   if (!focused) console.warn('⚠️ No se pudo enfocar el botón; ENTER igualmente.');
   await page.keyboard.press('Enter');
-  console.log('↩️ ENTER enviado al diálogo de Colab.');
+  console.log('↩️ ENTER enviado al diálogo.');
 
-  // Manejo de 1–2 consent popups
-  const firstPopup = await popupPromise;
-  await firstPopup.waitForLoadState('load', { timeout: 60000 });
-  await firstPopup.bringToFront();
-  console.log('🔓 Popup OAuth cargada:', firstPopup.url());
-  await handleOAuthPopupByEmailOrForm(firstPopup);
-  await new Promise(res => firstPopup.once('close', res));
-  console.log('✅ Popup #1 cerrada.');
-
-  // Si aparece un segundo popup, lo atendemos igual (best effort, 6s)
-  try {
-    const second = await context.waitForEvent('page', { timeout: 6000, predicate: p => p !== page }).catch(()=>null);
-    if (second) {
-      await second.waitForLoadState('load', { timeout: 30000 }).catch(()=>{});
-      await second.bringToFront().catch(()=>{});
-      console.log('🔓 Popup OAuth #2:', second.url());
-      await handleOAuthPopupByEmailOrForm(second);
-      await new Promise(res => second.once('close', res));
-      console.log('✅ Popup #2 cerrada.');
-    }
-  } catch {}
-
+  await waitForOAuthCascade(context, page, handleOAuthPopupByEmailOrForm, { windowMs: 60000, idleMs: 1200, detectTimeout: 12000 });
   await page.bringToFront();
-  console.log('🕰️ Margen para montar /content/drive…');
+  console.log('🕰️ Esperando montaje /content/drive…');
   await sleep(8000);
 
-  // 6) Celda 2 (tu “tercera” visual): obtener link trycloudflare
+  // Celda 3
   console.log('3️⃣ Ejecutando Celda 3…');
-  const editor2 = await page.locator('.cell.code').nth(2).locator('.monaco-editor').first();
-  await editor2.click();
-  await page.keyboard.down(mod); await page.keyboard.press('Enter'); await page.keyboard.up(mod);
+  await runCellByIndex(page, 2, false);
+  const outcome = await waitForCloudflareLinkOrTrueInCell(page, 2, { timeoutMs: 300000 });
 
-  console.log('👂 Esperando enlace trycloudflare…');
-  const link = await page
-    .locator("colab-static-output-renderer a[href*='trycloudflare.com']")
-    .first()
-    .waitFor({ timeout: 300000 })
-    .then(h => page.evaluate(a => a.href, h));
+  // === NUEVO: volver a la pestaña "Videos", descargar y eliminar video.mp3 ===
+  const videosTab = await switchToVideosTab(context);
+  const dlInfo = await downloadAndTrashFile(videosTab, 'video.mp3', { destDir: os.tmpdir?.() || '/tmp' });
 
-  console.log('✅ URL:', link);
-  return { result: link, page, browser };
+  if (outcome?.kind === 'link') {
+    console.log('✅ URL:', outcome.value);
+    return { result: outcome.value, downloaded: dlInfo, page, browser };
+  } else if (outcome?.kind === 'true') {
+    console.log('✅ Señal "True" detectada.');
+    return { result: true, downloaded: dlInfo, page, browser };
+  } else {
+    throw new Error('No se obtuvo enlace de Cloudflare ni "True" en la celda 3.');
+  }
 }
 
-/* ────────────────────────────────────────────────────────────────────────── */
 if (require.main === module) {
   drive_auto()
-    .then(({ result /*, browser*/ }) => {
-      console.log('\n📊 RESULTADO FINAL (URL):\n', result);
-      // await browser.close();
-    })
-    .catch(err => {
-      console.error('🔥 Error:', err?.stack || err?.message);
-      process.exit(1);
-    });
+    .then(({ result }) => { console.log('\n📊 RESULTADO FINAL:\n', result); })
+    .catch(err => { console.error('🔥 Error:', err?.stack || err?.message); process.exit(1); });
 }
 
 module.exports = { drive_auto };

@@ -1,6 +1,6 @@
-// auto_log_in.js
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 chromium.use(stealth);
@@ -9,6 +9,10 @@ chromium.use(stealth);
 const FIXED_FOLDER_URL = 'https://drive.google.com/drive/u/1/folders/1YROi4erJExtApAxCPbm9G0gjAHPPs8ir';
 const DELETE_BEFORE_UPLOAD = true;          // borrar antes para evitar diálogo
 const MAKE_LINK_PUBLIC = false;             // poner “Cualquiera con enlace” (opcional)
+const DESIRED_NAME         = 'video.mp4';
+
+/* ================== PERSISTENT CONTEXT ================== */
+const USER_DIR = path.join(os.tmpdir(), 'pw-profile-paco'); // perfil persistente
 
 /* ================== HELPERS BÁSICOS ================== */
 async function ensurePage(context, pageRef) {
@@ -29,12 +33,11 @@ function attachPageResilience(context, pageRef) {
   });
 }
 
-/* ================== BROWSER INDETECTABLE ================== */
+/* ================== BROWSER INDETECTABLE (PERSISTENTE) ================== */
 async function createUndetectableBrowser() {
-  console.log('🚀 Creando navegador indetectable…');
-  const browser = await chromium.launch({
+  console.log('🚀 Creando navegador indetectable (persistent context)…');
+  const context = await chromium.launchPersistentContext(USER_DIR, {
     headless: false,
-    executablePath: chromium.executablePath(),
     args: [
       '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
       '--disable-background-timer-throttling','--disable-renderer-backgrounding',
@@ -43,21 +46,23 @@ async function createUndetectableBrowser() {
       '--force-dark-mode','--enable-features=WebUIDarkMode',
     ],
     ignoreDefaultArgs: ['--enable-automation'],
-  });
-  const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    locale: 'es-ES',
-    timezoneId: 'Europe/Madrid'
+    locale: 'en-US',
+    timezoneId: 'Europe/Madrid',
+    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' }
   });
+
   await context.addInitScript(() => {
     try { delete Object.getPrototypeOf(navigator).webdriver; } catch {}
     if (!window.chrome) window.chrome = { runtime: {}, app: { isInstalled: false } };
   });
-  const pageRef = { page: await context.newPage() };
+
+  const pageRef = { page: context.pages()[0] || await context.newPage() };
   await pageRef.page.route('**/*', r => r.continue());
   attachPageResilience(context, pageRef);
-  return { browser, context, page: pageRef.page, pageRef };
+
+  return { browser: context.browser(), context, page: pageRef.page, pageRef };
 }
 
 /* ================== GOTO CON REINTENTOS ================== */
@@ -326,109 +331,121 @@ async function handleUploadConflictDialog(page, totalTimeoutMs = 20000) {
   return false;
 }
 
-/* ================== ESPERA ESTRICTA: <tr role="row" data-id> ================== */
-/**
- * Busca la fila REAL del grid (no chips/toasts) validando:
- *  - <tr role="row" data-id="..."> presente
- *  - Contiene el nombre exacto del archivo
- *  - Evita falsos positivos que contengan “Subida de archivo”, “subiendo”, etc.
- *  - (Best-effort) verifica que existan celdas “típicas” (tamaño/propietario)
- */
-async function waitForFileRowByDataIdOrName(page, fileName, timeoutMs = 5 * 60 * 1000) {
-  const start = Date.now();
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+/* ================== ESPERA SUBIDA: MISMO DOM QUE BORRADO ================== */
+async function waitForUploadedRowSameDOM(page, fileName, timeoutMs = 5 * 60 * 1000) {
+  const t0 = Date.now();
+  const snooze = (ms) => new Promise(r => setTimeout(r, ms));
 
-  const softRefresh = async () => {
+  async function nudgeGrid() {
     try {
-      await page.keyboard.press('ControlOrMeta+R');
-      await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(()=>{});
-      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(()=>{});
+      const grid = page.locator('[role="main"] [role="grid"]').first();
+      if (await grid.count()) {
+        await grid.evaluate(el => el.scrollBy(0, 500));
+        await snooze(100);
+        await grid.evaluate(el => el.scrollBy(0, -500));
+      } else {
+        await page.mouse.wheel(0, 600).catch(()=>{});
+        await snooze(100);
+        await page.mouse.wheel(0, -600).catch(()=>{});
+      }
     } catch {}
-  };
-  const hopRecentsAndBack = async () => {
+  }
+
+  async function hopRecentsAndBack() {
     try {
       const recent = page.locator('a[aria-label*="Recientes"], a[aria-label*="Recent"]').first();
       if (await recent.count()) {
         await recent.click().catch(()=>{});
         await page.waitForLoadState('domcontentloaded').catch(()=>{});
-        await page.waitForTimeout(700).catch(()=>{});
+        await snooze(500);
       }
     } catch {}
     try {
       const url = FIXED_FOLDER_URL.includes('?') ? `${FIXED_FOLDER_URL}&hl=es` : `${FIXED_FOLDER_URL}?hl=es`;
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(()=>{});
+      await waitForDriveReady(page);
     } catch {}
-  };
+  }
 
-  const getCandidateInfo = async () => {
+  async function findDivRow() {
     return await page.evaluate((name) => {
       const norm = (s)=> (s||'').toLowerCase();
-      const rows = Array.from(document.querySelectorAll('tr[role="row"][data-id]'));
-      for (const tr of rows) {
-        const text = (tr.innerText || tr.textContent || '').trim();
-        if (!text) continue;
-        const t = norm(text);
-        if (/(subida\s+de\s+archivo|uploading|subiendo)/i.test(t)) continue;
-        if (!t.includes(norm(name))) continue;
+      const wanted = norm(name);
+      const rows = Array.from(document.querySelectorAll('div[role="row"]'));
+      for (const r of rows) {
+        const text = norm((r.getAttribute('aria-label') || '') + ' ' + (r.innerText || ''));
+        if (!text.includes(wanted)) continue;
 
-        // Verificar presencia de celdas típicas (coincide con HTML de ejemplo del usuario)
-        const hasNameStrong = !!tr.querySelector('strong.DNoYtb');       // nombre visible
-        const hasOwnerCell  = !!tr.querySelector('[data-column-field="8"] .WQJtxb'); // “yo” etc.
-        const hasSizeCell   = !!tr.querySelector('[data-column-field="3"] .WQJtxb'); // “12,8 MB”
-        const okMeta = hasNameStrong || (hasOwnerCell && hasSizeCell);
+        if (r.querySelector('[role="progressbar"], [aria-busy="true"], [aria-live="polite"]')) continue;
 
-        if (!okMeta) continue;
+        const hasName =
+          !!r.querySelector('strong.DNoYtb') ||
+          !!r.querySelector(`[aria-label*="${name}"]`) ||
+          text.includes(wanted);
 
-        return {
-          id: tr.getAttribute('data-id') || null,
-          hasNameStrong, hasOwnerCell, hasSizeCell
-        };
+        if (!hasName) continue;
+
+        const dataId = r.getAttribute('data-id') || '';
+        return { dataId, html: r.outerHTML };
       }
       return null;
     }, fileName).catch(()=>null);
-  };
-
-  // Pequeña holgura para que aparezca la fila tras iniciar subida
-  await sleep(1500);
-
-  let cycle = 0;
-  while (Date.now() - start < timeoutMs) {
-    // ¿Aún hay indicadores de progreso?
-    const progress = await page.evaluate(() =>
-      !!document.querySelector('[role="progressbar"], [aria-live="polite"], [aria-live="assertive"]')
-    ).catch(()=>false);
-
-    const info = await getCandidateInfo();
-    if (info && info.id && (!progress)) {
-      console.log('🧩 Fila real detectada:', info);
-      const row = page.locator(`tr[role="row"][data-id="${info.id}"]`).first();
-      try { await row.waitFor({ state: 'visible', timeout: 4000 }); } catch {}
-      return { fileId: info.id, row };
-    }
-
-    // Alternar estrategias para forzar indexado/render
-    cycle++;
-    if (cycle % 6 === 1) {
-      await softRefresh();
-    } else if (cycle % 6 === 3) {
-      await hopRecentsAndBack();
-    }
-
-    await sleep(500);
   }
 
-  throw new Error(`Timeout esperando la fila real <tr data-id> para "${fileName}".`);
+  await snooze(1200);
+  let cycles = 0;
+
+  while (Date.now() - t0 < timeoutMs) {
+    const info = await findDivRow();
+    if (info) {
+      let row;
+      if (info.dataId) {
+        row = page.locator(`div[role="row"][data-id="${info.dataId}"]`).first();
+      } else {
+        row = page.locator(`div[role="row"]:has([aria-label*="${fileName}"]), div[role="row"]:has-text("${fileName}")`).first();
+      }
+      try { await row.waitFor({ state: 'visible', timeout: 4000 }); } catch {}
+      return { fileId: info.dataId || null, row };
+    }
+
+    cycles++;
+    if (cycles % 6 === 2) await nudgeGrid();
+    if (cycles % 10 === 0) await hopRecentsAndBack();
+    await snooze(300);
+  }
+
+  throw new Error(`Timeout esperando fila subida (DOM div[role="row"]) para "${fileName}".`);
+}
+
+// Si la fila no tiene data-id, abrir Vista Previa y extraer /file/d/<id>/ de la URL; luego volver.
+async function ensureFileIdFromRow(page, row) {
+  try {
+    const hasId = await row.getAttribute('data-id');
+    if (hasId) return hasId;
+  } catch {}
+
+  try {
+    await row.scrollIntoViewIfNeeded().catch(()=>{});
+    await row.click({ position: { x: 10, y: 10 } }).catch(()=>{});
+    await row.dblclick().catch(async () => { await page.keyboard.press('Enter').catch(()=>{}); });
+
+    await page.waitForURL(/\/file\/d\//, { timeout: 15000 });
+    const m = page.url().match(/\/file\/d\/([^/]+)/);
+    const id = m ? m[1] : null;
+
+    try { await page.keyboard.press('Escape'); await waitForDriveReady(page); } catch {}
+    return id;
+  } catch {
+    return null;
+  }
 }
 
 /* ================== VERIFICACIONES / SHARE ================== */
 async function getDisplayedNameFromRow(page, row) {
   try {
     const name = await row.evaluate((el) => {
-      // nombre fuerte
       const strong = el.querySelector('strong.DNoYtb');
       if (strong) return strong.textContent.trim();
-      // aria-label o texto de celda
       const attrName = el.getAttribute('aria-label') || '';
       if (attrName) return attrName;
       const cell = el.querySelector('[role="gridcell"][aria-label]');
@@ -483,109 +500,243 @@ async function makeAnyoneWithLinkViewer(page, row) {
 }
 
 /* ================== SUBIR ARCHIVO (UI) ================== */
-async function uploadFileToSpecificFolderUI(filePath) {
+async function uploadFileToSpecificFolderUI(filePath, opts = {}) {
   if (!fs.existsSync(filePath)) throw new Error(`Archivo no existe: ${filePath}`);
 
   const { browser, context, page } = await attemptGoogleLogin();
-  try {
-    const targetUrl = FIXED_FOLDER_URL.includes('?') ? `${FIXED_FOLDER_URL}&hl=es` : `${FIXED_FOLDER_URL}?hl=es`;
-    await gotoWithRetry(context, { page }, targetUrl);
-    console.log('📌 En carpeta fija u/1');
-    await waitForDriveReady(page);
-    await clearOverlays(page);
+  let keepOpen = !!opts.keepDriveOpen;
 
-    const desiredName = 'video.mp4';
+  const targetUrl = FIXED_FOLDER_URL.includes('?') ? `${FIXED_FOLDER_URL}&hl=es` : `${FIXED_FOLDER_URL}?hl=es`;
+  await gotoWithRetry(context, { page }, targetUrl);
+  console.log('📌 En carpeta fija u/1');
+  await waitForDriveReady(page);
+  await clearOverlays(page);
 
-    if (DELETE_BEFORE_UPLOAD) {
-      await trashExistingFile(page, desiredName).catch(()=>{});
-      await page.waitForTimeout(800).catch(()=>{});
-    }
+  const desiredName = DESIRED_NAME;
 
-    const attempts = 3;
-    const fileBuffer = fs.readFileSync(filePath);
-    const fileSpec = { name: desiredName, mimeType: 'video/mp4', buffer: fileBuffer };
-
-    let uploaded = false;
-    for (let i = 1; i <= attempts; i++) {
-      try {
-        await openNewMenu(page, 25000);
-        const chooserPromise = page.waitForEvent('filechooser', { timeout: 25000 });
-        await clickUploadFileItem(page);
-
-        let fileChooser = null;
-        try { fileChooser = await chooserPromise; } catch { console.log('⏱️ Sin filechooser; probamos Shift+u…'); }
-
-        if (!fileChooser) {
-          await page.keyboard.press('Shift+u').catch(()=>{});
-          try {
-            fileChooser = await page.waitForEvent('filechooser', { timeout: 4000 });
-            console.log('⌨️  filechooser vía Shift+u');
-          } catch {}
-        }
-
-        if (!fileChooser) {
-          const ok = await trySetInputFilesFallback(page, fileSpec, 7000);
-          if (!ok) throw new Error('Ni filechooser ni input[type=file] disponibles.');
-        } else {
-          await fileChooser.setFiles(fileSpec);
-        }
-
-        uploaded = true;
-        console.log('⬆️ Subida iniciada…');
-
-        if (!DELETE_BEFORE_UPLOAD) await handleUploadConflictDialog(page, 20000);
-        break;
-      } catch (e) {
-        console.log(`⚠️ Fallo al iniciar subida (intento ${i}/${attempts}): ${e.message}`);
-        await page.keyboard.press('Escape').catch(()=>{});
-        await page.waitForTimeout(600);
-      }
-    }
-
-    if (!uploaded) throw new Error('No se pudo iniciar la subida tras varios intentos.');
-    if (!DELETE_BEFORE_UPLOAD) await handleUploadConflictDialog(page, 8000).catch(()=>{});
-
-    // === ESPERA ESTRICTA: detectar realmente la fila del grid (<tr data-id>) ===
-    const { fileId, row } = await waitForFileRowByDataIdOrName(page, desiredName, 5 * 60 * 1000);
-    console.log('✅ Subida detectada y fila localizada. fileId =', fileId);
-
-    const displayedName = (await getDisplayedNameFromRow(page, row).catch(()=>null)) || desiredName;
-
-    // (Opcional) verificación secundaria en “Recientes”
-    let verifyMethod = 'tr[data-id]';
-    try {
-      const alsoInRecents = await verifyInRecents(page, desiredName).catch(()=>false);
-      if (alsoInRecents) verifyMethod = 'tr[data-id]+recents';
-    } catch {}
-
-    // (Opcional) hacer público y obtener link
-    let shareLink = null;
-    if (MAKE_LINK_PUBLIC) {
-      try { shareLink = await makeAnyoneWithLinkViewer(page, row); } catch {}
-    }
-
-    const result = {
-      ok: true,
-      name: desiredName,
-      displayedName,
-      verified: true,
-      verifyMethod,
-      id: fileId,
-      webViewLink: `https://drive.google.com/file/d/${fileId}/view`,
-      webContentLink: `https://drive.google.com/uc?export=download&id=${fileId}`,
-      shareLink
-    };
-    console.log('🏁 Final:', result);
-    return result;
-
-  } finally {
-    try { await context.close(); } catch {}
-    try { await browser.close(); } catch {}
+  if (DELETE_BEFORE_UPLOAD) {
+    await trashExistingFile(page, desiredName).catch(()=>{});
+    await page.waitForTimeout(800).catch(()=>{});
   }
+
+  const attempts = 3;
+  const fileBuffer = fs.readFileSync(filePath);
+  const fileSpec = { name: desiredName, mimeType: 'video/mp4', buffer: fileBuffer };
+
+  let uploadedTrigger = false;
+
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await openNewMenu(page, 25000);
+      const chooserPromise = page.waitForEvent('filechooser', { timeout: 25000 });
+      await clickUploadFileItem(page);
+
+      let fileChooser = null;
+      try { fileChooser = await chooserPromise; } catch { console.log('⏱️ Sin filechooser; probamos Shift+u…'); }
+
+      if (!fileChooser) {
+        await page.keyboard.press('Shift+u').catch(()=>{});
+        try {
+          fileChooser = await page.waitForEvent('filechooser', { timeout: 4000 });
+          console.log('⌨️  filechooser vía Shift+u');
+        } catch {}
+      }
+
+      if (!fileChooser) {
+        const ok = await trySetInputFilesFallback(page, fileSpec, 7000);
+        if (!ok) throw new Error('Ni filechooser ni input[type=file] disponibles.');
+      } else {
+        await fileChooser.setFiles(fileSpec);
+      }
+
+      uploadedTrigger = true;
+      console.log('⬆️ Subida iniciada…');
+
+      if (!DELETE_BEFORE_UPLOAD) await handleUploadConflictDialog(page, 20000);
+      break;
+    } catch (e) {
+      console.log(`⚠️ Fallo al iniciar subida (intento ${i}/${attempts}): ${e.message}`);
+      await page.keyboard.press('Escape').catch(()=>{});
+      await page.waitForTimeout(600);
+    }
+  }
+
+  if (!uploadedTrigger) throw new Error('No se pudo iniciar la subida tras varios intentos.');
+  if (!DELETE_BEFORE_UPLOAD) await handleUploadConflictDialog(page, 8000).catch(()=>{});
+
+  const { fileId: maybeId, row } =
+    await waitUntilUploadedUsingSameDOM(page, DESIRED_NAME, { maxMs: 5*60*1000, pollMs: 300 });
+
+  const fileId = maybeId || await ensureFileIdFromRow(page, row);
+  if (!fileId) console.warn('⚠️ No se pudo extraer fileId (continuamos).');
+
+  let displayedName = DESIRED_NAME;
+  try {
+    displayedName = (await getDisplayedNameFromRow(page, row).catch(()=>null)) || DESIRED_NAME;
+  } catch {}
+
+  let shareLink = null;
+  if (MAKE_LINK_PUBLIC && row) {
+    try { shareLink = await makeAnyoneWithLinkViewer(page, row); } catch {}
+  }
+
+  const result = {
+    ok: true,
+    name: DESIRED_NAME,
+    displayedName,
+    verified: true,
+    verifyMethod: 'same-dom-loop',
+    id: fileId || null
+  };
+  if (fileId) {
+    result.webViewLink    = `https://drive.google.com/file/d/${fileId}/view`;
+    result.webContentLink = `https://drive.google.com/uc?export=download&id=${fileId}`;
+  }
+  result.shareLink = shareLink || null;
+
+  console.log('🏁 Final:', result);
+
+  if (!keepOpen) {
+    try { await context.close(); } catch {}
+  }
+
+  return result;
+}
+
+async function waitUntilUploadedUsingSameDOM(page, name, {
+  maxMs = 5 * 60 * 1000,
+  pollMs = 300
+} = {}) {
+  const t0 = Date.now();
+  let cycles = 0;
+
+  const snooze = (ms) => new Promise(r => setTimeout(r, ms));
+  const nudgeGrid = async () => {
+    try {
+      const grid = page.locator('[role="main"] [role="grid"]').first();
+      if (await grid.count()) {
+        await grid.evaluate(el => el.scrollBy(0, 600));
+        await snooze(60);
+        await grid.evaluate(el => el.scrollBy(0, -600));
+      } else {
+        await page.mouse.wheel(0, 600).catch(()=>{});
+        await snooze(60);
+        await page.mouse.wheel(0, -600).catch(()=>{});
+      }
+    } catch {}
+  };
+  const hopRecentsAndBack = async () => {
+    try {
+      const recent = page.locator('a[aria-label*="Recientes"], a[aria-label*="Recent"]').first();
+      if (await recent.count()) {
+        await recent.click().catch(()=>{});
+        await page.waitForLoadState('domcontentloaded').catch(()=>{});
+        await snooze(300);
+      }
+    } catch {}
+    try {
+      await page.goto(FIXED_FOLDER_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await waitForDriveReady(page);
+    } catch {}
+  };
+
+  const appearsNow = async () => {
+    return await page.evaluate((fileName) => {
+      const norm = (s)=> (s||'').toLowerCase();
+      const wanted = norm(fileName);
+      const main = document.querySelector('div[role="main"]');
+      if (!main) return null;
+
+      const rows = Array.from(main.querySelectorAll('div[role="row"]'));
+      for (const r of rows) {
+        const text = norm((r.getAttribute('aria-label') || '') + ' ' + (r.textContent || ''));
+        if (!text.includes(wanted)) continue;
+        if (r.querySelector('[role="progressbar"], [aria-busy="true"], [aria-live="polite"]')) continue;
+        return { id: r.getAttribute('data-id') || null };
+      }
+      const cells = Array.from(main.querySelectorAll('div[role="gridcell"][aria-label]'));
+      for (const c of cells) {
+        const text = norm(c.getAttribute('aria-label') || '');
+        if (!text.includes(wanted)) continue;
+        if (c.querySelector('[role="progressbar"], [aria-busy="true"], [aria-live="polite"]')) continue;
+        const host = c.closest('[data-id]') || c;
+        return { id: host.getAttribute('data-id') || null };
+      }
+      const any = Array.from(main.querySelectorAll('[aria-label]'));
+      for (const el of any) {
+        const text = norm(el.getAttribute('aria-label') || '');
+        if (!text.includes(wanted)) continue;
+        if (el.querySelector && el.querySelector('[role="progressbar"], [aria-busy="true"], [aria-live="polite"]')) continue;
+        const host = el.closest('[data-id]') || el;
+        return { id: host.getAttribute('data-id') || null };
+      }
+      return null;
+    }, name).catch(()=>null);
+  };
+
+  await waitForDriveReady(page);
+
+  while (Date.now() - t0 < maxMs) {
+    const info = await appearsNow();
+    if (info) {
+      const row = info.id
+        ? page.locator(`[data-id="${info.id}"]`).first()
+        : (await findRowByName(page, name)) || page.locator(`div[role="row"]:has-text("${name}")`).first();
+      try { await row.waitFor({ state: 'visible', timeout: 3000 }); } catch {}
+      console.log(`✅ (SAME-DOM) Detectado "${name}" ${info.id ? `(id=${info.id})` : '(sin data-id)'}`);
+      return { fileId: info.id || null, row };
+    }
+    cycles++;
+    if (cycles % 6 === 2) await nudgeGrid();
+    if (cycles % 12 === 0) await hopRecentsAndBack();
+    await snooze(pollMs);
+  }
+
+  throw new Error(`Timeout esperando subida de "${name}" con el mismo DOM.`);
+}
+
+/* ================== NUEVO: cambiar a pestaña Videos ================== */
+async function switchToVideosTab(context) {
+  let page = context.pages().find(p => !p.isClosed() && p.url().includes('drive.google.com'));
+  if (!page) page = await context.newPage();
+  const target = FIXED_FOLDER_URL.includes('?') ? `${FIXED_FOLDER_URL}&hl=es` : `${FIXED_FOLDER_URL}?hl=es`;
+  await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await waitForDriveReady(page);
+  await page.bringToFront();
+  console.log('📁 Pestaña Drive posicionada en carpeta "Videos".');
+  return page;
+}
+
+/* ================== NUEVO: descargar y eliminar un archivo ================== */
+async function downloadAndTrashFile(page, fileName, { destDir = os.tmpdir(), timeoutMs = 120000 } = {}) {
+  await waitForDriveReady(page);
+  const row = await findRowByName(page, fileName);
+  if (!row) throw new Error(`No se encontró "${fileName}" en la carpeta.`);
+  const fileId = await ensureFileIdFromRow(page, row);
+  if (!fileId) throw new Error(`No se pudo obtener fileId de "${fileName}".`);
+
+  const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
+  console.log(`⬇️ Descargando "${fileName}" desde ${url}`);
+
+  const [download] = await Promise.all([
+    page.waitForEvent('download', { timeout: timeoutMs }),
+    page.evaluate(u => { const a = document.createElement('a'); a.href = u; a.target = '_blank'; a.rel='noopener'; document.body.appendChild(a); a.click(); a.remove(); }, url)
+  ]);
+
+  const suggested = download.suggestedFilename();
+  const targetPath = path.join(destDir, suggested || fileName);
+  await download.saveAs(targetPath);
+  console.log('💾 Guardado en:', targetPath);
+
+  // Limpieza: enviar a papelera el .mp3
+  await trashExistingFile(page, fileName).catch(()=>{});
+  console.log(`🗑️ "${fileName}" enviado a la papelera en Drive.`);
+
+  return { path: targetPath, fileId };
 }
 
 /** Alias compatible; siempre carpeta fija u/1 */
-async function uploadFileToDriveUI(filePath, _opts = {}) { return uploadFileToSpecificFolderUI(filePath); }
+async function uploadFileToDriveUI(filePath, opts = {}) { return uploadFileToSpecificFolderUI(filePath, opts); }
 
 module.exports = {
   attemptGoogleLogin,
@@ -594,4 +745,13 @@ module.exports = {
   gotoWithRetry,
   uploadFileToSpecificFolderUI,
   uploadFileToDriveUI,
+  // NUEVO:
+  switchToVideosTab,
+  downloadAndTrashFile,
+  FIXED_FOLDER_URL,
+  // Helpers exportados:
+  waitForDriveReady,
+  waitForUploadedRowSameDOM,
+  ensureFileIdFromRow,
+  findRowByName,
 };

@@ -1,20 +1,14 @@
-// app.js (secuencial: Drive -> GPU Colab -> Python remoto)
+// app.js — Flujo mínimo: Drive UI -> Colab (drive_auto) y listo
 const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawn } = require("child_process");
 const cors = require("cors");
 
-// Helpers externos (ya existentes en tu proyecto)
-const { uploadFileToDriveUI } = require("./auto_log_in.js"); // UI Drive
-const { enableGpuAndRun } = require("./gpu_enabler.js");     // Colab GPU
-
-// Helpers de túnel
-const axios = require("axios");
-const dns = require("dns").promises;
-const { URL } = require("url");
+// Helpers propios
+const { uploadFileToDriveUI } = require("./auto_log_in.js"); // Subida UI a Drive
+const { drive_auto } = require("./drive_auto.js");           // Ejecuta notebook Colab
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -37,95 +31,13 @@ app.use(cors({
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 
-// Subidas a /tmp (solo para la subida UI a Drive)
+// Subida temporal (solo para pasar el archivo a la UI de Drive)
 const upload = multer({
   dest: os.tmpdir(),
   limits: { fileSize: 1024 * 1024 * 1024 }, // 1 GB
 });
 
-// ===== Helpers Python =====
-function resolvePythonExecutable() {
-  const candidates = [
-    path.resolve(__dirname, "venv", "bin", "python"),
-    "/app/venv/bin/python",
-    process.env.PYTHON_BIN,
-    "python3",
-    "python",
-  ].filter(Boolean);
-
-  for (const c of candidates) {
-    try {
-      if ((c === "python3" || c === "python") || fs.existsSync(c)) return c;
-    } catch {}
-  }
-  throw new Error("No se encontró Python del venv. Verifica __dirname/venv o /app/venv.");
-}
-
-function runPythonScript(scriptRelPath, args) {
-  return new Promise((resolve, reject) => {
-    const pythonExecutable = resolvePythonExecutable();
-    const scriptPath = path.resolve(__dirname, scriptRelPath);
-    console.log(`🐍 Python: ${pythonExecutable} -X utf8 ${scriptPath} ${args.map(a => JSON.stringify(a)).join(" ")}`);
-
-    const p = spawn(pythonExecutable, ["-X", "utf8", scriptPath, ...args], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let out = "", err = "";
-    p.stdout.on("data", d => { const s=d.toString("utf8"); process.stdout.write(`[PY_STDOUT] ${s}`); out += s; });
-    p.stderr.on("data", d => { const s=d.toString("utf8"); process.stderr.write(`[PY_STDERR] ${s}`); err += s; });
-
-    p.on("error", (e) => reject(new Error(`Fallo al ejecutar Python: ${e.message}`)));
-    p.on("close", (code) => {
-      console.log(`🐍 Python terminó con código: ${code}`);
-      if (code === 0) return resolve(out.trim());
-      reject(new Error(`Script salió con código ${code}. STDERR: ${err || "(vacío)"}\nSTDOUT: ${out || "(vacío)"}`));
-    });
-  });
-}
-
-// ===== Helpers de Túnel (espera activa a Cloudflare/worker) =====
-async function waitForTunnelReady(baseUrl, { maxWaitMs = 45000, stepMs = 800 } = {}) {
-  if (!/^https?:\/\//i.test(baseUrl)) throw new Error("gpuUrl inválida");
-  const u = new URL(baseUrl);
-  const deadline = Date.now() + maxWaitMs;
-  let lastErr = "unknown";
-
-  // probamos http y https por si el worker solo expuso uno
-  const candidates = Array.from(new Set([
-    baseUrl.replace(/^http:/i, "https:"),
-    baseUrl.replace(/^https:/i, "http:")
-  ])).map(x => x.replace(/\/+$/,""));
-
-  while (Date.now() < deadline) {
-    for (const cand of candidates) {
-      try {
-        // 1) DNS
-        await dns.lookup(u.hostname);
-
-        // 2) /health
-        const health = await axios.get(cand + "/health", { timeout: 2500, validateStatus: () => true });
-        if (health.status === 200) return cand;
-
-        // 3) /execute (eco) — prueba real de endpoint
-        const exec = await axios.post(
-          cand + "/execute",
-          { script_content: "import json; print(json.dumps({'ok': True,'ping':'pong'}))", params: [] },
-          { timeout: 2500, validateStatus: () => true }
-        );
-        if (exec.status === 200) return cand;
-
-        lastErr = `health=${health.status} exec=${exec.status}`;
-      } catch (e) {
-        lastErr = e.message || String(e);
-      }
-    }
-    await new Promise(r => setTimeout(r, stepMs));
-  }
-  throw new Error("tunnel_not_ready: " + lastErr);
-}
-
-// ===== Multer fields =====
+// Campos aceptados
 const uploadFields = upload.fields([
   { name: "file", maxCount: 1 },
   { name: "imageFile", maxCount: 1 },
@@ -143,24 +55,9 @@ function pickUploadedFile(req) {
   );
 }
 
-// ===== Detección básica de tipo (solo informativa) =====
-function guessMediaKind(originalName, mimetype) {
-  const ext = (path.extname(originalName || "").toLowerCase());
-  const typeRoot = (mimetype || "").split("/")[0];
-
-  const videoExts = new Set([".mp4",".mov",".mkv",".webm",".avi",".m4v",".mpg",".mpeg",".wmv"]);
-  const audioExts = new Set([".mp3",".wav",".m4a",".aac",".flac",".ogg",".oga",".wma",".opus",".amr",".aiff",".aif"]);
-
-  const isVideo = typeRoot === "video" || videoExts.has(ext);
-  const isAudio = typeRoot === "audio" || audioExts.has(ext);
-
-  return { isVideo, isAudio, ext };
-}
-
-// ===== Endpoint: orden estricto Drive -> GPU -> Python (solo URL) =====
+// === Endpoint principal: SOLO Drive -> Colab ===
 app.post("/match", uploadFields, async (req, res) => {
   console.log("📥 POST /match recibido");
-  let browserToClose = null;
 
   try {
     const f = pickUploadedFile(req);
@@ -170,65 +67,50 @@ app.post("/match", uploadFields, async (req, res) => {
 
     const localPath    = f.path;
     const originalName = f.originalname || f.filename;
-    const mimetype     = f.mimetype || "";
-    const { isVideo, isAudio } = guessMediaKind(originalName, mimetype);
 
-    // === 1) Subir ORIGINAL a Drive por UI (bloqueante) ===
+    // 1) Subir a Drive por UI y **cerrar** ventana al terminar (comportamiento por defecto)
     console.log("① Subiendo archivo a Drive (UI)...");
-    const uploadedOriginal = await uploadFileToDriveUI(localPath, { folderName: "Videos" });
+    const uploadedOriginal = await uploadFileToDriveUI(localPath /* sin keepDriveOpen */);
     console.log("✅ Subida finalizada:", uploadedOriginal?.name || originalName);
 
-    // === 2) Arrancar GPU en Colab y ESPERAR túnel (bloqueante) ===
-    console.log("② Arrancando GPU en Colab (gpu_enabler)...");
-    let gpuUrl = "";
-    try {
-      const { result, browser } = await enableGpuAndRun();
-      browserToClose = browser || null;
-      const rawUrl = result || "";
-      console.log("⏳ Verificando disponibilidad del túnel...", rawUrl);
-      gpuUrl = await waitForTunnelReady(rawUrl, { maxWaitMs: 45000, stepMs: 800 });
-      console.log("✅ GPU URL lista:", gpuUrl);
-    } catch (e) {
-      console.error("⚠️ GPU no lista:", e.message);
-      return res.status(502).json({ ok: false, error: "gpu_url_unavailable", detail: e.message });
-    }
+    // 2) Abrir Colab y ejecutar celdas (drive_auto). Aquí **dejamos abierto** el navegador.
+    console.log("② Ejecutando drive_auto (Colab)...");
+    const { result: colabUrl /*, page, browser */ } = await drive_auto();
+    console.log("✅ drive_auto listo. URL reportada por notebook:", colabUrl);
 
-    // === 3) Ejecutar script Python REMOTO (solo le pasamos LA URL) ===
-    console.log("③ Ejecutando script Python remoto (solo GPU URL)...");
-    let pythonOutput = null;
-    try {
-      pythonOutput = await runPythonScript("mp4_to_mp3.py", [gpuUrl]);
-      console.log("✅ Python remoto OK");
-    } catch (e) {
-      console.error("🔥 Error en ejecución Python remota:", e.message);
-      return res.status(500).json({ ok: false, error: "python_remote_failed", detail: e.message });
-    }
-
-    // Limpieza del archivo local subido
+    // Limpieza del archivo temporal local
     try { if (fs.existsSync(localPath)) fs.rmSync(localPath, { force: true }); } catch {}
 
-    // Respuesta clara (el Python devuelve JSON en stdout; aquí lo enviamos tal cual + info extra)
-    let pipeline = {};
-    try { pipeline = JSON.parse(pythonOutput); } catch (_) { pipeline = { raw: pythonOutput }; }
-
+    // Respuesta mínima solicitada
     return res.json({
       ok: true,
-      type: isVideo ? "video" : (isAudio ? "audio" : "other"),
-      drive: {
-        original: uploadedOriginal   // resultado de la subida del original
-      },
-      gpu: { url: gpuUrl },         // URL Cloudflare lista
-      pipeline                       // salida del script Python remoto (incluye rutas en Drive)
+      drive: { original: uploadedOriginal },
+      colab: { url: colabUrl }
     });
 
   } catch (err) {
     console.error("🔥 Error en /match:", err);
     return res.status(500).json({ error: err.message || String(err) });
-  } finally {
-    if (browserToClose) {
-      try { if (browserToClose.isConnected()) await browserToClose.close(); }
-      catch (e) { console.error("⚠️ Error cerrando el navegador de gpu_enabler:", e.message); }
-    }
+  }
+});
+
+app.post("/drive-auto", async (req, res) => {
+  // Colab a veces tarda: subimos el timeout de la petición
+  req.setTimeout(12 * 60 * 1000); // 12 minutos
+
+  console.log("▶️ POST /drive-auto — iniciando drive_auto()");
+  try {
+    const { result: colabUrl /*, page, browser */ } = await drive_auto();
+    console.log("✅ drive_auto OK. URL:", colabUrl);
+
+    // Importante: NO cerramos el navegador aquí (queda abierto para depuración)
+    return res.json({
+      ok: true,
+      colab: { url: colabUrl }
+    });
+  } catch (err) {
+    console.error("🔥 Error en /drive-auto:", err);
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
