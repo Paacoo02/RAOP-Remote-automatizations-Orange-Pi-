@@ -1,3 +1,4 @@
+// auto_log_in.js
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -9,7 +10,7 @@ chromium.use(stealth);
 const FIXED_FOLDER_URL = 'https://drive.google.com/drive/u/1/folders/1YROi4erJExtApAxCPbm9G0gjAHPPs8ir';
 const DELETE_BEFORE_UPLOAD = true;          // borrar antes para evitar diálogo
 const MAKE_LINK_PUBLIC = false;             // poner “Cualquiera con enlace” (opcional)
-const DESIRED_NAME         = 'video.mp4';
+const DESIRED_NAME = 'video.mp4';
 
 /* ================== PERSISTENT CONTEXT ================== */
 const USER_DIR = path.join(os.tmpdir(), 'pw-profile-paco'); // perfil persistente
@@ -307,7 +308,7 @@ async function trashExistingFile(page, name) {
   return true;
 }
 
-/* ================== DIÁLOGO CONFLICTO (si no borras antes) ================== */
+/* ================== DIÁLOGO CONFLICTO ================== */
 async function handleUploadConflictDialog(page, totalTimeoutMs = 20000) {
   const start = Date.now();
   while (Date.now() - start < totalTimeoutMs) {
@@ -331,7 +332,7 @@ async function handleUploadConflictDialog(page, totalTimeoutMs = 20000) {
   return false;
 }
 
-/* ================== ESPERA SUBIDA: MISMO DOM QUE BORRADO ================== */
+/* ================== ESPERA SUBIDA (MISMO DOM) ================== */
 async function waitForUploadedRowSameDOM(page, fileName, timeoutMs = 5 * 60 * 1000) {
   const t0 = Date.now();
   const snooze = (ms) => new Promise(r => setTimeout(r, ms));
@@ -417,27 +418,80 @@ async function waitForUploadedRowSameDOM(page, fileName, timeoutMs = 5 * 60 * 10
   throw new Error(`Timeout esperando fila subida (DOM div[role="row"]) para "${fileName}".`);
 }
 
-// Si la fila no tiene data-id, abrir Vista Previa y extraer /file/d/<id>/ de la URL; luego volver.
-async function ensureFileIdFromRow(page, row) {
-  try {
-    const hasId = await row.getAttribute('data-id');
-    if (hasId) return hasId;
-  } catch {}
+// Variante usada por uploadFileToSpecificFolderUI
+async function waitUntilUploadedUsingSameDOM(page, name, {
+  maxMs = 5 * 60 * 1000,
+  pollMs = 300
+} = {}) {
+  const t0 = Date.now();
+  let cycles = 0;
 
-  try {
-    await row.scrollIntoViewIfNeeded().catch(()=>{});
-    await row.click({ position: { x: 10, y: 10 } }).catch(()=>{});
-    await row.dblclick().catch(async () => { await page.keyboard.press('Enter').catch(()=>{}); });
+  const snooze = (ms) => new Promise(r => setTimeout(r, ms));
+  const nudgeGrid = async () => {
+    try {
+      const grid = page.locator('[role="main"] [role="grid"]').first();
+      if (await grid.count()) {
+        await grid.evaluate(el => el.scrollBy(0, 600));
+        await snooze(60);
+        await grid.evaluate(el => el.scrollBy(0, -600));
+      } else {
+        await page.mouse.wheel(0, 600).catch(()=>{});
+        await snooze(60);
+        await page.mouse.wheel(0, -600).catch(()=>{});
+      }
+    } catch {}
+  };
 
-    await page.waitForURL(/\/file\/d\//, { timeout: 15000 });
-    const m = page.url().match(/\/file\/d\/([^/]+)/);
-    const id = m ? m[1] : null;
+  const appearsNow = async () => {
+    return await page.evaluate((fileName) => {
+      const norm = (s)=> (s||'').toLowerCase();
+      const wanted = norm(fileName);
+      const main = document.querySelector('div[role="main"]');
+      if (!main) return null;
 
-    try { await page.keyboard.press('Escape'); await waitForDriveReady(page); } catch {}
-    return id;
-  } catch {
-    return null;
+      const rows = Array.from(main.querySelectorAll('div[role="row"]'));
+      for (const r of rows) {
+        const text = norm((r.getAttribute('aria-label') || '') + ' ' + (r.textContent || ''));
+        if (!text.includes(wanted)) continue;
+        if (r.querySelector('[role="progressbar"], [aria-busy="true"], [aria-live="polite"]')) continue;
+        return { id: r.getAttribute('data-id') || null };
+      }
+      const cells = Array.from(main.querySelectorAll('div[role="gridcell"][aria-label]'));
+      for (const c of cells) {
+        const text = norm(c.getAttribute('aria-label') || '');
+        if (!text.includes(wanted)) continue;
+        if (c.querySelector('[role="progressbar"], [aria-busy="true"], [aria-live="polite"]')) continue;
+        const host = c.closest('[data-id]') || c;
+        return { id: host.getAttribute('data-id') || null };
+      }
+      const any = Array.from(main.querySelectorAll('[aria-label]'));
+      for (const el of any) {
+        const text = norm(el.getAttribute('aria-label') || '');
+        if (!text.includes(wanted)) continue;
+        if (el.querySelector && el.querySelector('[role="progressbar"], [aria-busy="true"], [aria-live="polite"]')) continue;
+        const host = el.closest('[data-id]') || el;
+        return { id: host.getAttribute('data-id') || null };
+      }
+      return null;
+    }, name).catch(()=>null);
+  };
+
+  while (Date.now() - t0 < maxMs) {
+    const info = await appearsNow();
+    if (info) {
+      const row = info.id
+        ? page.locator(`[data-id="${info.id}"]`).first()
+        : (await findRowByName(page, name)) || page.locator(`div[role="row"]:has-text("${name}")`).first();
+      try { await row.waitFor({ state: 'visible', timeout: 3000 }); } catch {}
+      console.log(`✅ (SAME-DOM) Detectado "${name}" ${info.id ? `(id=${info.id})` : '(sin data-id)'}`);
+      return { fileId: info.id || null, row };
+    }
+    cycles++;
+    if (cycles % 6 === 2) await nudgeGrid();
+    await snooze(pollMs);
   }
+
+  throw new Error(`Timeout esperando subida de "${name}" con el mismo DOM (sin navegación).`);
 }
 
 /* ================== VERIFICACIONES / SHARE ================== */
@@ -497,6 +551,28 @@ async function makeAnyoneWithLinkViewer(page, row) {
   }
   await page.keyboard.press('Escape').catch(()=>{});
   return link;
+}
+
+async function ensureFileIdFromRow(page, row) {
+  try {
+    const hasId = await row.getAttribute('data-id');
+    if (hasId) return hasId;
+  } catch {}
+
+  try {
+    await row.scrollIntoViewIfNeeded().catch(()=>{});
+    await row.click({ position: { x: 10, y: 10 } }).catch(()=>{});
+    await row.dblclick().catch(async () => { await page.keyboard.press('Enter').catch(()=>{}); });
+
+    await page.waitForURL(/\/file\/d\//, { timeout: 15000 });
+    const m = page.url().match(/\/file\/d\/([^/]+)/);
+    const id = m ? m[1] : null;
+
+    try { await page.keyboard.press('Escape'); await waitForDriveReady(page); } catch {}
+    return id;
+  } catch {
+    return null;
+  }
 }
 
 /* ================== SUBIR ARCHIVO (UI) ================== */
@@ -596,7 +672,6 @@ async function uploadFileToSpecificFolderUI(filePath, opts = {}) {
 
   console.log('🏁 Final:', result);
 
-  // ⬇️ CLAVE: si keepDriveOpen => NO cerrar y devolver context/page para reusar
   if (opts && opts.keepDriveOpen) {
     return { ...result, context, page };   // ← devolvemos handles vivos
   } else {
@@ -604,85 +679,6 @@ async function uploadFileToSpecificFolderUI(filePath, opts = {}) {
     return result;
   }
 }
-
-async function waitUntilUploadedUsingSameDOM(page, name, {
-  maxMs = 5 * 60 * 1000,
-  pollMs = 300
-} = {}) {
-  const t0 = Date.now();
-  let cycles = 0;
-
-  const snooze = (ms) => new Promise(r => setTimeout(r, ms));
-  const nudgeGrid = async () => {
-    try {
-      const grid = page.locator('[role="main"] [role="grid"]').first();
-      if (await grid.count()) {
-        await grid.evaluate(el => el.scrollBy(0, 600));
-        await snooze(60);
-        await grid.evaluate(el => el.scrollBy(0, -600));
-      } else {
-        await page.mouse.wheel(0, 600).catch(()=>{});
-        await snooze(60);
-        await page.mouse.wheel(0, -600).catch(()=>{});
-      }
-    } catch {}
-  };
-
-  const appearsNow = async () => {
-    return await page.evaluate((fileName) => {
-      const norm = (s)=> (s||'').toLowerCase();
-      const wanted = norm(fileName);
-      const main = document.querySelector('div[role="main"]');
-      if (!main) return null;
-
-      const rows = Array.from(main.querySelectorAll('div[role="row"]'));
-      for (const r of rows) {
-        const text = norm((r.getAttribute('aria-label') || '') + ' ' + (r.textContent || ''));
-        if (!text.includes(wanted)) continue;
-        if (r.querySelector('[role="progressbar"], [aria-busy="true"], [aria-live="polite"]')) continue;
-        return { id: r.getAttribute('data-id') || null };
-      }
-      const cells = Array.from(main.querySelectorAll('div[role="gridcell"][aria-label]'));
-      for (const c of cells) {
-        const text = norm(c.getAttribute('aria-label') || '');
-        if (!text.includes(wanted)) continue;
-        if (c.querySelector('[role="progressbar"], [aria-busy="true"], [aria-live="polite"]')) continue;
-        const host = c.closest('[data-id]') || c;
-        return { id: host.getAttribute('data-id') || null };
-      }
-      const any = Array.from(main.querySelectorAll('[aria-label]'));
-      for (const el of any) {
-        const text = norm(el.getAttribute('aria-label') || '');
-        if (!text.includes(wanted)) continue;
-        if (el.querySelector && el.querySelector('[role="progressbar"], [aria-busy="true"], [aria-live="polite"]')) continue;
-        const host = el.closest('[data-id]') || el;
-        return { id: host.getAttribute('data-id') || null };
-      }
-      return null;
-    }, name).catch(()=>null);
-  };
-
-  // NO hagas waitForDriveReady() aquí; evita provocar logs/esperas extra durante la subida.
-
-  while (Date.now() - t0 < maxMs) {
-    const info = await appearsNow();
-    if (info) {
-      const row = info.id
-        ? page.locator(`[data-id="${info.id}"]`).first()
-        : (await findRowByName(page, name)) || page.locator(`div[role="row"]:has-text("${name}")`).first();
-      try { await row.waitFor({ state: 'visible', timeout: 3000 }); } catch {}
-      console.log(`✅ (SAME-DOM) Detectado "${name}" ${info.id ? `(id=${info.id})` : '(sin data-id)'}`);
-      return { fileId: info.id || null, row };
-    }
-    cycles++;
-    // Solo "mueve" el grid para forzar repintado, sin navegar
-    if (cycles % 6 === 2) await nudgeGrid();
-    await snooze(pollMs);
-  }
-
-  throw new Error(`Timeout esperando subida de "${name}" con el mismo DOM (sin navegación).`);
-}
-
 
 /* ================== NUEVO: cambiar a pestaña Videos ================== */
 async function switchToVideosTab(context) {
@@ -696,7 +692,7 @@ async function switchToVideosTab(context) {
   return page;
 }
 
-/* ================== NUEVO: descargar y eliminar un archivo ================== */
+/* ================== DESCARGA MÉTODO ANTIGUO (via fileId) ================== */
 async function downloadAndTrashFile(page, fileName, { destDir = os.tmpdir(), timeoutMs = 120000 } = {}) {
   await waitForDriveReady(page);
   const row = await findRowByName(page, fileName);
@@ -717,11 +713,75 @@ async function downloadAndTrashFile(page, fileName, { destDir = os.tmpdir(), tim
   await download.saveAs(targetPath);
   console.log('💾 Guardado en:', targetPath);
 
-  // Limpieza: enviar a papelera el .mp3
   await trashExistingFile(page, fileName).catch(()=>{});
   console.log(`🗑️ "${fileName}" enviado a la papelera en Drive.`);
 
   return { path: targetPath, fileId };
+}
+
+/* ================== NUEVO: DESCARGA POR MENÚ “Descargar” ================== */
+async function clickDownloadInMenu(page) {
+  const candidates = [
+    // Item de menú contextual / overflow
+    'div[role="menuitem"]:has-text("Descargar")',
+    'div[role="menuitem"]:has-text("Download")',
+    // aria-label o data-tooltip en item
+    'div.a-v-T[aria-label="Descargar"]',
+    'div.a-v-T[data-tooltip="Descargar"]',
+    'div.a-v-T[aria-label="Download"]',
+    'div.a-v-T[data-tooltip="Download"]',
+    // Botón en toolbar cuando hay fila seleccionada
+    'div[aria-label="Descargar"]:not([aria-disabled="true"])',
+    'div[aria-label="Download"]:not([aria-disabled="true"])',
+    'button:has-text("Descargar")',
+    'button:has-text("Download")',
+  ];
+  const loc = page.locator(candidates.join(', ')).first();
+  await loc.waitFor({ state: 'visible', timeout: 8000 });
+  await loc.scrollIntoViewIfNeeded().catch(()=>{});
+  await loc.click();
+  console.log('⬇️  Click en "Descargar" (menú).');
+}
+
+async function downloadAndTrashFileViaMenu(page, fileName, { destDir = os.tmpdir(), timeoutMs = 120000 } = {}) {
+  await waitForDriveReady(page);
+
+  // 1) localizar la fila
+  const row = await findRowByName(page, fileName);
+  if (!row) throw new Error(`No se encontró "${fileName}" en la carpeta.`);
+
+  await row.scrollIntoViewIfNeeded().catch(()=>{});
+  // Seleccionar la fila (habilita toolbar por si overflow falla)
+  await row.click({ position: { x: 10, y: 10 } }).catch(()=>{});
+
+  // 2) abrir el menú “kebab” o menú contextual
+  const opened = await openRowOverflowMenu(page, row);
+  if (!opened) {
+    // si el kebab falla, intenta desde toolbar directa “Descargar”
+    console.log('⚠️ No se pudo abrir overflow; probamos toolbar directa.');
+  }
+
+  // 3) preparar espera de descarga y pulsar “Descargar”
+  const downloadPromise = page.waitForEvent('download', { timeout: timeoutMs });
+  try {
+    await clickDownloadInMenu(page);
+  } catch (e) {
+    // si no hubo item en overflow, reintenta con la toolbar
+    console.log('↪️ Reintento: buscar botón de "Descargar" en toolbar…');
+    await clickDownloadInMenu(page); // mismo helper cubre toolbar
+  }
+
+  const download = await downloadPromise; // espera el archivo
+  const suggested = download.suggestedFilename();
+  const targetPath = path.join(destDir, suggested || fileName);
+  await download.saveAs(targetPath);
+  console.log('💾 Guardado en:', targetPath);
+
+  // 4) enviar a papelera el archivo (reutiliza tu lógica)
+  await trashExistingFile(page, fileName).catch(()=>{});
+  console.log(`🗑️ "${fileName}" enviado a la papelera.`);
+
+  return { path: targetPath, fileId: null, via: 'menu' };
 }
 
 /** Alias compatible; siempre carpeta fija u/1 */
@@ -736,13 +796,18 @@ module.exports = {
   gotoWithRetry,
   uploadFileToSpecificFolderUI,
   uploadFileToDriveUI,
-  // NUEVO:
+  // pestaña / descarga
   switchToVideosTab,
-  downloadAndTrashFile,
+  downloadAndTrashFile,          // método antiguo
+  downloadAndTrashFileViaMenu,   // ← NUEVO método por menú
+  clickDownloadInMenu,           // opcional export
+  // consts
   FIXED_FOLDER_URL,
   // Helpers exportados:
   waitForDriveReady,
   waitForUploadedRowSameDOM,
   ensureFileIdFromRow,
   findRowByName,
+  waitUntilUploadedUsingSameDOM,
+  trashExistingFile,
 };
