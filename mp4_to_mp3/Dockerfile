@@ -20,7 +20,7 @@ RUN set -eux; \
     libgstreamer1.0-0 gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-tools \
     fonts-freefont-ttf fonts-dejavu fonts-noto-color-emoji \
     libatomic1 libevent-2.1-7 libavif15 libharfbuzz-icu0 libenchant-2-2 \
-    libsecret-1-0 libhyphen0 libmanette-0.2-0 libxss1; \
+    libsecret-1-0 libhyphen0 libmanette-0.2-0 libxss1 dos2unix; \
   if apt-cache show libwoff2dec1 >/dev/null 2>&1; then \
     apt-get install -y --no-install-recommends libwoff2dec1; \
   elif apt-cache show libwoff2-1 >/dev/null 2>&1; then \
@@ -37,14 +37,12 @@ WORKDIR /app
 # ======================================================
 # 📦 Node + Playwright (¡ARREGLO DEFINITIVO!)
 # ======================================================
-# El error pide 'chromium-1193', que corresponde a playwright v1.40.0
 ENV PLAYWRIGHT_VERSION_TARGET=1.40.0
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN mkdir -p /ms-playwright && chown -R root:root /ms-playwright
 
 COPY package*.json ./
 
-# Instala playwright@1.40.0 Y LUEGO sus navegadores
 RUN --mount=type=cache,target=/root/.npm bash -lc '\
   if [ -f package-lock.json ]; then \
     echo "🔒 package-lock.json encontrado → npm ci"; \
@@ -58,8 +56,9 @@ RUN --mount=type=cache,target=/root/.npm bash -lc '\
   echo "📥 Instalando navegador chromium (para v${PLAYWRIGHT_VERSION_TARGET})..." && \
   npx playwright install --with-deps chromium \
 '
+
 # ======================================================
-# 🔐 Configuración de SSH (sin cambios)
+# 🔐 Configuración de SSH
 # ======================================================
 RUN useradd -ms /bin/bash devuser && echo "devuser:devpass" | chpasswd && \
     echo "root:root" | chpasswd && mkdir -p /var/run/sshd && \
@@ -68,15 +67,18 @@ RUN useradd -ms /bin/bash devuser && echo "devuser:devpass" | chpasswd && \
     echo "AllowUsers devuser root" >> /etc/ssh/sshd_config
 
 # ======================================================
-# ⚙️ Copia de código y permisos (sin cambios)
+# ⚙️ Copia del código y normalización de scripts
 # ======================================================
 COPY . .
-RUN chmod +x /app/start.sh /app/clear_ssh_host.sh || true
+
+# 🔧 Normaliza los finales de línea y asegura permisos de ejecución
+RUN find /app -type f -name "*.sh" -exec dos2unix {} \; && \
+    chmod +x /app/*.sh
 
 EXPOSE 22 6080 5901 3001
 
 # ======================================================
-# 🌙 Configuración del entorno por defecto (sin cambios)
+# 🌙 Configuración del entorno
 # ======================================================
 ENV NODE_ENV=production \
     DISPLAY=:99 \
@@ -84,6 +86,6 @@ ENV NODE_ENV=production \
     HEADLESS=false
 
 # ======================================================
-# 🚀 Comando de arranque (sin cambios)
+# 🚀 Comando de arranque
 # ======================================================
 CMD ["/bin/bash", "-c", "/app/clear_ssh_host.sh && service ssh restart && echo '🟢 SSH en ejecución (puerto 22)' && while true; do sleep 3600; done"]

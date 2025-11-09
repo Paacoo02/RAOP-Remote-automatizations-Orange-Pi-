@@ -68,14 +68,16 @@ app.post("/match", uploadFields, async (req, res) => {
     const localPath    = f.path;
     const originalName = f.originalname || f.filename;
 
-    // 1) Subir a Drive por UI y **cerrar** ventana al terminar (comportamiento por defecto)
     console.log("① Subiendo archivo a Drive (UI)...");
-    const uploadedOriginal = await uploadFileToDriveUI(localPath /* sin keepDriveOpen */);
+    const uploadedOriginal = await uploadFileToDriveUI(localPath, { keepDriveOpen: true }); // ⬅️ importante
     console.log("✅ Subida finalizada:", uploadedOriginal?.name || originalName);
 
-    // 2) Abrir Colab y ejecutar celdas (drive_auto). Aquí **dejamos abierto** el navegador.
+    // 2) Reutilizar el MISMO context/pestaña de Drive para abrir Colab
     console.log("② Ejecutando drive_auto (Colab)...");
-    const { result: colabUrl /*, page, browser */ } = await drive_auto();
+    const { result: colabUrl /*, page, context */ } = await drive_auto({
+      context: uploadedOriginal.context,
+      drivePage: uploadedOriginal.page
+    });
     console.log("✅ drive_auto listo. URL reportada por notebook:", colabUrl);
 
     // Limpieza del archivo temporal local

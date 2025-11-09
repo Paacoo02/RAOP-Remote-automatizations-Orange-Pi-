@@ -596,11 +596,13 @@ async function uploadFileToSpecificFolderUI(filePath, opts = {}) {
 
   console.log('🏁 Final:', result);
 
-  if (!keepOpen) {
+  // ⬇️ CLAVE: si keepDriveOpen => NO cerrar y devolver context/page para reusar
+  if (opts && opts.keepDriveOpen) {
+    return { ...result, context, page };   // ← devolvemos handles vivos
+  } else {
     try { await context.close(); } catch {}
+    return result;
   }
-
-  return result;
 }
 
 async function waitUntilUploadedUsingSameDOM(page, name, {
@@ -623,20 +625,6 @@ async function waitUntilUploadedUsingSameDOM(page, name, {
         await snooze(60);
         await page.mouse.wheel(0, -600).catch(()=>{});
       }
-    } catch {}
-  };
-  const hopRecentsAndBack = async () => {
-    try {
-      const recent = page.locator('a[aria-label*="Recientes"], a[aria-label*="Recent"]').first();
-      if (await recent.count()) {
-        await recent.click().catch(()=>{});
-        await page.waitForLoadState('domcontentloaded').catch(()=>{});
-        await snooze(300);
-      }
-    } catch {}
-    try {
-      await page.goto(FIXED_FOLDER_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await waitForDriveReady(page);
     } catch {}
   };
 
@@ -674,7 +662,7 @@ async function waitUntilUploadedUsingSameDOM(page, name, {
     }, name).catch(()=>null);
   };
 
-  await waitForDriveReady(page);
+  // NO hagas waitForDriveReady() aquí; evita provocar logs/esperas extra durante la subida.
 
   while (Date.now() - t0 < maxMs) {
     const info = await appearsNow();
@@ -687,13 +675,14 @@ async function waitUntilUploadedUsingSameDOM(page, name, {
       return { fileId: info.id || null, row };
     }
     cycles++;
+    // Solo "mueve" el grid para forzar repintado, sin navegar
     if (cycles % 6 === 2) await nudgeGrid();
-    if (cycles % 12 === 0) await hopRecentsAndBack();
     await snooze(pollMs);
   }
 
-  throw new Error(`Timeout esperando subida de "${name}" con el mismo DOM.`);
+  throw new Error(`Timeout esperando subida de "${name}" con el mismo DOM (sin navegación).`);
 }
+
 
 /* ================== NUEVO: cambiar a pestaña Videos ================== */
 async function switchToVideosTab(context) {
@@ -736,7 +725,9 @@ async function downloadAndTrashFile(page, fileName, { destDir = os.tmpdir(), tim
 }
 
 /** Alias compatible; siempre carpeta fija u/1 */
-async function uploadFileToDriveUI(filePath, opts = {}) { return uploadFileToSpecificFolderUI(filePath, opts); }
+async function uploadFileToDriveUI(filePath, opts = {}) {
+  return uploadFileToSpecificFolderUI(filePath, opts);
+}
 
 module.exports = {
   attemptGoogleLogin,

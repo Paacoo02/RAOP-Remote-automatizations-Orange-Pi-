@@ -1,28 +1,33 @@
+// drive_auto.js — Abre Colab, monta Drive, espera link/True y descarga/borra un archivo desde la carpeta
 'use strict';
 
-const fs = require('fs');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const os = require('os');
 const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+puppeteer.use(StealthPlugin());
+
 const {
   attemptGoogleLogin,
-  switchToVideosTab,          // ← NUEVO
-  downloadAndTrashFile,       // ← NUEVO
+  switchToVideosTab,
+  downloadAndTrashFile,
   FIXED_FOLDER_URL
 } = require('./auto_log_in.js');
 
-const stealth = StealthPlugin();
-puppeteer.use(stealth);
-
 const COLAB_NOTEBOOK_URL =
+  process.env.COLAB_NOTEBOOK_URL ||
   'https://colab.research.google.com/drive/1WjbE6Cez95NnBn4AhLgisCHG2FJuDrmk?usp=sharing&hl=en';
+
+const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const EMAIL = process.env.GOOGLE_USER || 'pacoplanestomas@gmail.com';
 const PASS  = process.env.GOOGLE_PASS  || '392002Planes0.';
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
+function isOAuthLikeUrl(u = '') {
+  return /accounts\.google\.com|ServiceLogin|signin|oauth|consent|gsi|challenge\/pwd/i.test(u);
+}
 
-/* ---------- helpers UI Colab (igual que antes) ---------- */
 async function waitAndFocusConnectButton(page, timeoutMs = 60000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
@@ -61,7 +66,44 @@ async function waitAndFocusConnectButton(page, timeoutMs = 60000) {
   }
   return false;
 }
+
+async function waitForOAuthCascade(context, hostPage, handlePopupFn, {
+  windowMs = 60000, idleMs = 1200
+} = {}) {
+  const handled = new Set();
+  const deadline = Date.now() + windowMs;
+  let lastActivity = Date.now();
+
+  const onPage = (p) => {};
+  context.on('page', onPage);
+  try {
+    while (Date.now() < deadline) {
+      const candidates = (await context.pages()).filter(p => p && !p.isClosed() && p !== hostPage && !handled.has(p));
+      let popup = null;
+      for (const p of candidates) {
+        try { await p.waitForLoadState?.('domcontentloaded', { timeout: 12000 }).catch(()=>{}); } catch {}
+        const url = p.url?.() || '';
+        if (isOAuthLikeUrl(url)) { popup = p; break; }
+      }
+      if (!popup) {
+        if (Date.now() - lastActivity >= idleMs) break;
+        await sleep(200);
+        continue;
+      }
+      handled.add(popup);
+      await popup.bringToFront().catch(()=>{});
+      await handlePopupFn(popup);
+      await Promise.race([
+        new Promise(res => popup.once?.('close', res)),
+        popup.waitForURL?.(u => /colab\.research\.google\.com/i.test(u), { timeout: 15000 }).catch(()=>{})
+      ]);
+      lastActivity = Date.now();
+    }
+  } finally { context.off?.('page', onPage); }
+}
+
 async function handleOAuthPopupByEmailOrForm(p) {
+  // 1) tarjeta de cuenta directa
   try {
     let candidate = p.locator(`[data-email="${EMAIL}"]`).first();
     if (!(await candidate.count())) {
@@ -72,8 +114,11 @@ async function handleOAuthPopupByEmailOrForm(p) {
       await candidate.click();
       console.log(`🟢 Cuenta seleccionada por email: ${EMAIL}`);
     }
-  } catch (e) { console.log('ℹ️ No selección directa:', e.message); }
+  } catch (e) {
+    console.log('ℹ️ No se pudo seleccionar tarjeta directa:', e.message);
+  }
 
+  // 2) formulario email → pass (si aparece)
   try {
     const emailBox = p.locator('#identifierId:visible, input[name="identifier"]:visible, input[type="email"]:visible').first();
     if (await emailBox.count()) {
@@ -105,58 +150,24 @@ async function handleOAuthPopupByEmailOrForm(p) {
       }
       console.log('🟢 Password enviado.');
     }
-  } catch (e) { console.log('ℹ️ Flujo formulario no requerido:', e.message); }
+  } catch (e) {
+    console.log('ℹ️ Flujo de formulario no requerido:', e.message);
+  }
 
-  for (let i = 0; i < 3; i++) {
+  // 3) 1-2 pantallas de “Consent”
+  for (let i = 0; i < 4; i++) {
     try {
-      const cont = p.locator('button:has-text("Continue"), button:has-text("Continuar")').first();
-      await cont.waitFor({ state: 'visible', timeout: 8000 });
+      const cont = p.locator('button:has-text("Continuar"), button:has-text("Continue")').first();
+      await cont.waitFor({ state: 'visible', timeout: 15000 });
       await cont.click();
-      await p.waitForTimeout(500);
+      await p.waitForTimeout(600);
       console.log(`➡️ Consent #${i + 1}`);
-    } catch { break; }
+    } catch {
+      break;
+    }
   }
 }
-function isOAuthLikeUrl(u = '') {
-  return /accounts\.google\.com|ServiceLogin|signin|oauth|consent|gsi|challenge\/pwd/i.test(u);
-}
-async function waitForOAuthCascade(context, hostPage, handlePopupFn, {
-  windowMs = 60000, idleMs = 1200, detectTimeout = 12000,
-} = {}) {
-  const handled = new Set();
-  const deadline = Date.now() + windowMs;
-  let lastActivity = Date.now();
 
-  const newlySeen = new Set();
-  const onPage = (p) => { if (p !== hostPage) newlySeen.add(p); };
-  context.on('page', onPage);
-  try {
-    while (Date.now() < deadline) {
-      const candidates = [...context.pages(), ...newlySeen]
-        .filter(p => p && !p.isClosed() && p !== hostPage && !handled.has(p));
-
-      let popup = null;
-      for (const p of candidates) {
-        try { await p.waitForLoadState('domcontentloaded', { timeout: 12000 }).catch(()=>{}); } catch {}
-        const url = p.url();
-        if (isOAuthLikeUrl(url)) { popup = p; break; }
-      }
-      if (!popup) {
-        if (Date.now() - lastActivity >= idleMs) break;
-        await sleep(200);
-        continue;
-      }
-      handled.add(popup);
-      await popup.bringToFront().catch(()=>{});
-      await handlePopupFn(popup);
-      await Promise.race([
-        new Promise(res => popup.once('close', res)),
-        popup.waitForURL(u => /colab\.research\.google\.com/i.test(u), { timeout: 15000 }).catch(()=>{})
-      ]);
-      lastActivity = Date.now();
-    }
-  } finally { context.off('page', onPage); }
-}
 async function openRuntimeMenu(page) {
   const buttons = ['#runtime-menu-button','[aria-label="Runtime"]','[aria-label="Entorno de ejecución"]','text=Runtime','text=Entorno de ejecución'];
   for (const sel of buttons) {
@@ -171,6 +182,7 @@ async function openRuntimeMenu(page) {
   }
   return false;
 }
+
 async function clickRuntimeRestartLike(page) {
   const candidates = [
     '.goog-menuitem:has-text("Restart runtime")','.goog-menuitem:has-text("Factory reset runtime")','.goog-menuitem:has-text("Disconnect and delete runtime")',
@@ -182,6 +194,7 @@ async function clickRuntimeRestartLike(page) {
   await item.waitFor({ state: 'visible', timeout: 8000 });
   await item.click();
 }
+
 async function confirmYesOkDialogs(page) {
   const tryClick = async () => {
     return await page.evaluate(() => {
@@ -210,6 +223,7 @@ async function confirmYesOkDialogs(page) {
     );
   } catch {}
 }
+
 async function restartRuntimeFlexible(page) {
   console.log("🔌 Reiniciando entorno de ejecución...");
   if (await openRuntimeMenu(page)) {
@@ -237,6 +251,7 @@ async function restartRuntimeFlexible(page) {
     console.log('✅ Reinicio desde dropdown.');
   } catch (e) { console.error('❌ Error detallado al reiniciar:', e); throw e; }
 }
+
 async function waitForCellToFinish(page, idx = 0, { timeoutMs = 300000, pollMs = 250 } = {}) {
   console.log(`🕒 Esperando tick ✓ en la celda #${idx}…`);
   const handle = await page.waitForFunction(
@@ -285,6 +300,7 @@ async function waitForCellToFinish(page, idx = 0, { timeoutMs = 300000, pollMs =
   await new Promise(r => setTimeout(r, 400));
   console.log(`✅ Celda #${idx} finalizada con ✓ tick.`);
 }
+
 async function ensureRunButtonIndex(page, idx, timeoutMs = 120000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
@@ -295,6 +311,7 @@ async function ensureRunButtonIndex(page, idx, timeoutMs = 120000) {
   }
   return false;
 }
+
 async function runCellByIndex(page, idx, waitTick = false) {
   const ok = await ensureRunButtonIndex(page, idx);
   if (!ok) throw new Error(`No se encontró el Run Button de la celda #${idx}.`);
@@ -304,6 +321,7 @@ async function runCellByIndex(page, idx, waitTick = false) {
   await runBtn.click();
   if (waitTick) await waitForCellToFinish(page, idx);
 }
+
 async function waitForCloudflareLinkOrTrueInCell(page, idx = 2, { timeoutMs = 300000, pollMs = 300 } = {}) {
   console.log(`👂 Esperando enlace trycloudflare.com o la cadena "True" en la celda #${idx}…`);
   const handle = await page.waitForFunction(
@@ -337,106 +355,107 @@ async function waitForCloudflareLinkOrTrueInCell(page, idx = 2, { timeoutMs = 30
 }
 
 /* ---------- Flujo principal ---------- */
-async function drive_auto() {
+async function drive_auto({ context: injectedContext, drivePage: injectedDrivePage } = {}) {
   console.log('🚀 Iniciando el flujo en Google Colab…');
-  let browser, context, page;
-  ({ browser, context, page } = await attemptGoogleLogin());
-  if (!page || page.isClosed() || !page.url().includes('drive.google.com')) {
-    throw new Error('Login process failed to land on Google Drive.');
-  }
-  console.log(`[Main] Confirmada página en Google Drive: ${page.url()}`);
 
-  // Posiciona Drive en la carpeta Videos (para que al volver esté en la misma vista)
+  let context, drivePage;
+  if (injectedContext && injectedDrivePage) {
+    context   = injectedContext;
+    drivePage = injectedDrivePage;
+    console.log('🔗 Reutilizando contexto/pestaña existentes.');
+  } else {
+    const login = await attemptGoogleLogin();
+    context   = login.context;
+    drivePage = login.page;
+  }
+
+  // Asegura carpeta fija sin cerrar ni abrir de nuevo
   try {
-    const target = FIXED_FOLDER_URL.includes('?') ? `${FIXED_FOLDER_URL}&hl=es` : `${FIXED_FOLDER_URL}?hl=es`;
-    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    console.log('📁 Drive posicionado en carpeta "Videos".');
+    await drivePage.goto(FIXED_FOLDER_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    console.log('📁 Drive posicionado en carpeta fija.');
   } catch (e) { console.warn('⚠️ No se pudo posicionar en la carpeta fija:', e.message); }
 
-  // Abrir Colab en pestaña
+  // Abrir Colab en pestaña nueva dentro del MISMO context
   console.log(`🌍 Abriendo notebook (pestaña nueva): ${COLAB_NOTEBOOK_URL}`);
+  const opener = (url) => {
+    const a = document.createElement('a');
+    a.href = url; a.target = '_blank'; a.rel = 'noopener';
+    document.body.appendChild(a); a.click(); a.remove();
+  };
+
   const [colabPage] = await Promise.all([
-    context.waitForEvent('page', { timeout: 30000 }),
-    page.evaluate((url) => {
-      const a = document.createElement('a');
-      a.href = url; a.target = '_blank'; a.rel = 'noopener';
-      document.body.appendChild(a); a.click(); a.remove();
-    }, COLAB_NOTEBOOK_URL)
+    context.waitForEvent('page', {
+      timeout: 30000,
+      predicate: p => {
+        try { const u = typeof p.url === 'function' ? p.url() : (p.url || ''); return u.includes('colab.research.google.com'); }
+        catch { return false; }
+      }
+    }),
+    drivePage.evaluate(opener, COLAB_NOTEBOOK_URL),
   ]);
 
   await colabPage.bringToFront();
-  try { await colabPage.waitForLoadState('domcontentloaded', { timeout: 240000 }); } catch (e) { console.warn('⚠️ domcontentloaded tardó:', e.message); }
-  await colabPage.locator('.cell.code').first().waitFor({ state: 'visible', timeout: 120000 });
+  try { await colabPage.waitForLoadState?.('domcontentloaded', { timeout: 240000 }); } catch {}
+  try { await colabPage.waitForSelector?.('.cell.code', { timeout: 120000 }); } catch {}
   console.log('✅ Editor de Colab visible.');
 
-  page = colabPage;
-
-  // Limpiezas/diálogos
-  try { const runAnyway = page.locator('colab-dialog button:has-text("Run anyway")').first(); if (await runAnyway.count()) { await runAnyway.click(); await sleep(600); } } catch {}
-  try { const welcomeClose = page.locator('colab-dialog[class*="welcome-dialog"] #close-icon').first(); if (await welcomeClose.count()) { await welcomeClose.click(); await sleep(300); } } catch {}
-  try {
-    const editBtn = page.locator('#edit-menu-button, [aria-label="Edit"], text=Edit').first();
-    await editBtn.click();
-    const clearItem = page.locator('.goog-menuitem:has-text("Clear all outputs"), [role="menuitem"]:has-text("Clear all outputs")').first();
-    await clearItem.waitFor({ state: 'visible', timeout: 2500 });
-    await clearItem.click();
-    await page.locator('#edit-menu, [role="menu"]:has-text("Clear")').first().waitFor({ state: 'hidden', timeout: 2500 }).catch(()=>{});
-    console.log('🧹 Salidas limpiadas.');
-  } catch { console.warn('ℹ️ No se pudo limpiar (UI distinta o sin salidas).'); }
+  // Limpieza de diálogos
+  try { const runAnyway = colabPage.locator?.('colab-dialog button:has-text("Run anyway")')?.first?.(); if (runAnyway && await runAnyway.count?.()) { await runAnyway.click?.(); await sleep(600); } } catch {}
+  try { const welcomeClose = colabPage.locator?.('colab-dialog[class*="welcome-dialog"] #close-icon')?.first?.(); if (welcomeClose && await welcomeClose.count?.()) { await welcomeClose.click?.(); await sleep(300); } } catch {}
 
   // Celda 0 + reinicio runtime
   console.log('1️⃣ Ejecutando primera celda…');
-  const runBtn0 = page.locator('colab-run-button').first();
-  await runBtn0.waitFor({ state: 'visible', timeout: 20000 });
-  await runBtn0.click();
-  await sleep(1200);
-  await restartRuntimeFlexible(page);
+  try {
+    const runBtn0 = colabPage.locator?.('colab-run-button')?.first?.();
+    await runBtn0?.waitFor?.({ state: 'visible', timeout: 20000 });
+    await runBtn0?.click?.();
+    await sleep(1200);
+  } catch {}
+  await restartRuntimeFlexible(colabPage);
 
   // Re-ejecutar celda 0
   try {
-    const editor0 = await page.locator('.cell.code').nth(0).locator('.monaco-editor').first();
-    await editor0.click();
-    await page.keyboard.down(mod); await page.keyboard.press('Enter'); await page.keyboard.up(mod);
+    const editor0 = colabPage.locator?.('.cell.code')?.nth?.(0)?.locator?.('.monaco-editor')?.first?.();
+    await editor0?.click?.();
+    await colabPage.keyboard?.down(mod); await colabPage.keyboard?.press('Enter'); await colabPage.keyboard?.up(mod);
     console.log('✅ Celda 0 re-ejecutada.');
-    await waitForCellToFinish(page, 0).catch(()=>{});
+    await waitForCellToFinish(colabPage, 0).catch(()=>{});
   } catch (e) { console.warn('⚠️ No se pudo relanzar celda 0:', e.message); }
 
   // Celda 2: montar Drive + consents
   console.log('2️⃣ Ejecutando Celda 2 (montaje Drive)…');
-  const editor1 = await page.locator('.cell.code').nth(1).locator('.monaco-editor').first();
-  await editor1.click();
-  await page.keyboard.down(mod); await page.keyboard.press('Enter'); await page.keyboard.up(mod);
-  console.log('⏳ Espera ~5s…'); 
+  try {
+    const editor1 = colabPage.locator?.('.cell.code')?.nth?.(1)?.locator?.('.monaco-editor')?.first?.();
+    await editor1?.click?.();
+    await colabPage.keyboard?.down(mod); await colabPage.keyboard?.press('Enter'); await colabPage.keyboard?.up(mod);
+  } catch {}
+  console.log('⏳ Espera breve…'); 
   await sleep(5000);
 
-  const focused = await waitAndFocusConnectButton(page, 30000);
+  const focused = await waitAndFocusConnectButton(colabPage, 30000);
   if (!focused) console.warn('⚠️ No se pudo enfocar el botón; ENTER igualmente.');
-  await page.keyboard.press('Enter');
+  await colabPage.keyboard?.press('Enter');
   console.log('↩️ ENTER enviado al diálogo.');
 
-  await waitForOAuthCascade(context, page, handleOAuthPopupByEmailOrForm, { windowMs: 60000, idleMs: 1200, detectTimeout: 12000 });
-  await page.bringToFront();
+  await waitForOAuthCascade(context, colabPage, handleOAuthPopupByEmailOrForm, { windowMs: 60000, idleMs: 1200 });  await colabPage.bringToFront();
   console.log('🕰️ Esperando montaje /content/drive…');
   await sleep(8000);
 
   // Celda 3
   console.log('3️⃣ Ejecutando Celda 3…');
-  await runCellByIndex(page, 2, false);
-  const outcome = await waitForCloudflareLinkOrTrueInCell(page, 2, { timeoutMs: 300000 });
+  await runCellByIndex(colabPage, 2, false);
+  const outcome = await waitForCloudflareLinkOrTrueInCell(colabPage, 2, { timeoutMs: 300000 });
 
-  // === NUEVO: volver a la pestaña "Videos", descargar y eliminar video.mp3 ===
+  // Volver a pestaña "Videos", descargar y eliminar video.mp3
   const videosTab = await switchToVideosTab(context);
   const dlInfo = await downloadAndTrashFile(videosTab, 'video.mp3', { destDir: os.tmpdir?.() || '/tmp' });
 
-  if (outcome?.kind === 'link') {
-    console.log('✅ URL:', outcome.value);
-    return { result: outcome.value, downloaded: dlInfo, page, browser };
+   if (outcome?.kind === 'link') {
+    return { result: outcome.value, page: colabPage, context };
   } else if (outcome?.kind === 'true') {
-    console.log('✅ Señal "True" detectada.');
-    return { result: true, downloaded: dlInfo, page, browser };
-  } else {
-    throw new Error('No se obtuvo enlace de Cloudflare ni "True" en la celda 3.');
+    return { result: true, page: colabPage, context };
   }
+  throw new Error('No se obtuvo enlace de Cloudflare ni "True" en la celda 3.');
 }
 
 if (require.main === module) {
