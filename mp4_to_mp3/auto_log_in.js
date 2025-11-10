@@ -66,6 +66,41 @@ async function createUndetectableBrowser() {
   return { browser: context.browser(), context, page: pageRef.page, pageRef };
 }
 
+/* ================== NUEVO: navegador específico para Riverside ================== */
+async function createRiversideBrowser() {    console.log('🚀 Creando navegador (Riverside) con SW habilitados…');
+    const profileDir = path.join(os.tmpdir(), 'pw-profile-riverside'); // perfil separado
+    const context = await chromium.launchPersistentContext(profileDir, {
+      headless: false,
+      serviceWorkers: 'allow',           // ← clave para uploader moderno
+      ignoreHTTPSErrors: true,
+      args: [
+        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+        '--disable-background-timer-throttling','--disable-renderer-backgrounding',
+        '--mute-audio','--no-first-run','--no-default-browser-check',
+        '--window-size=1920,1080',
+        '--force-dark-mode','--enable-features=WebUIDarkMode',
+        // (opcional) mantenemos GPU desactivada en Xvfb: '--disable-gpu',
+      ],
+      ignoreDefaultArgs: ['--enable-automation'],
+      viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      locale: 'es-ES',
+      timezoneId: 'Europe/Madrid',
+      extraHTTPHeaders: { 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' }
+    });
+  
+    await context.addInitScript(() => {
+      try { delete Object.getPrototypeOf(navigator).webdriver; } catch {}
+      if (!window.chrome) window.chrome = { runtime: {}, app: { isInstalled: false } };
+    });
+  
+    const pageRef = { page: context.pages()[0] || await context.newPage() };
+    await pageRef.page.route('**/*', r => r.continue());
+    attachPageResilience(context, pageRef);
+  
+    return { browser: context.browser(), context, page: pageRef.page, pageRef };
+  }
+
 /* ================== GOTO CON REINTENTOS ================== */
 async function gotoWithRetry(context, pageRef, url, opts = {}) {
   const max = 3;
@@ -810,4 +845,5 @@ module.exports = {
   findRowByName,
   waitUntilUploadedUsingSameDOM,
   trashExistingFile,
+  createRiversideBrowser
 };
