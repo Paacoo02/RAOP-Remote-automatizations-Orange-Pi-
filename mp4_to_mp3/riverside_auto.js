@@ -1,4 +1,4 @@
-// riverside.js
+// riverside_auto.js
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -12,6 +12,7 @@ const DEBUG_FETCH_XHR = true;
 const BLOCK_SERVICE_WORKERS = false;
 const UPLOAD_STUCK_TIMEOUT = 20000;
 const UPLOAD_TOTAL_TIMEOUT = 180000;
+const READY_WAIT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min
 
 /* ==================== Navegador limpio para Riverside ==================== */
 async function createRiversideBrowser() {
@@ -21,7 +22,7 @@ async function createRiversideBrowser() {
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
   const context = await browser.newContext({
-    acceptDownloads: true,         // ← necesario para capturar descargas
+    acceptDownloads: true,         // necesario para capturar descargas
     locale: "es-ES",
     timezoneId: "Europe/Madrid",
   });
@@ -60,6 +61,17 @@ function findLatestMedia({
 
   hits.sort((a, b) => b.mtime - a.mtime);
   return hits[0].file;
+}
+
+// Wrapper compatible con tu uso en app.js
+function findLatestMp3(opts = {}) {
+  const { preferName = null, preferNames = null, extraDirs = [] } = opts || {};
+  const names = preferNames || (preferName ? [preferName] : ["video.mp3"]);
+  return findLatestMedia({
+    preferNames: names,
+    exts: [".mp3"],
+    extraDirs,
+  });
 }
 
 /* ==================== Helper genérico: parar en el primero que funcione ==================== */
@@ -197,7 +209,6 @@ async function safeScrollIntoView(locator, timeout = 1200) {
       if (handle) {
         await handle.evaluate((el) => {
           try { el.scrollIntoView({ block: "center", inline: "center" }); } catch {}
-          // intentar desplazar el contenedor scrollable más cercano
           let p = el.parentElement;
           while (p) {
             const cs = getComputedStyle(p);
@@ -290,11 +301,9 @@ async function markConsentCheckboxEnhanced(page) {
     return false;
   }
 
-  // 0) Intentar traerlo a viewport, sin bloquear
   await safeScrollIntoView(checkbox, 1200).catch(() => {});
   await page.waitForTimeout(250).catch(()=>{});
 
-  // 1) Si ya está marcado, listo
   try {
     if (await checkbox.isChecked({ timeout: 500 }).catch(() => false)) {
       console.log("✅ Checkbox ya estaba marcado");
@@ -302,7 +311,6 @@ async function markConsentCheckboxEnhanced(page) {
     }
   } catch {}
 
-  // 2) check() nativo (no fatal)
   try {
     await checkbox.check({ force: true, timeout: 1200 });
     if (await checkbox.isChecked().catch(() => false)) {
@@ -313,7 +321,6 @@ async function markConsentCheckboxEnhanced(page) {
     console.log("ℹ️ .check() no interactuable (seguimos).");
   }
 
-  // 3) Click con force
   try {
     await checkbox.click({ force: true, timeout: 1200 });
     await page.waitForTimeout(200);
@@ -323,7 +330,6 @@ async function markConsentCheckboxEnhanced(page) {
     }
   } catch {}
 
-  // 4) JS directo (no requiere visibilidad)
   const jsSuccess = await page.evaluate(() => {
     try {
       const cb = document.getElementById("human-verification");
@@ -343,7 +349,6 @@ async function markConsentCheckboxEnhanced(page) {
     return true;
   }
 
-  // 5) Label asociado
   try {
     const label = page.locator('label[for="human-verification"]').first();
     if (await label.count()) {
@@ -356,7 +361,6 @@ async function markConsentCheckboxEnhanced(page) {
     }
   } catch {}
 
-  // 6) Mouse real (si tiene bounding box)
   try {
     const box = await checkbox.boundingBox();
     if (box) {
@@ -378,7 +382,6 @@ async function markConsentCheckboxEnhanced(page) {
 async function solveTurnstile(page, { timeoutMs = 15000 } = {}) {
   console.log("🧩 Intentando resolver Cloudflare Turnstile (best-effort)…");
 
-  // 1) Click en iframe (si existe)
   try {
     const ifr = page.frameLocator('iframe[title*="Turnstile"], iframe[src*="challenges.cloudflare.com"]').first();
     const has = await ifr.locator("body").count();
@@ -392,7 +395,6 @@ async function solveTurnstile(page, { timeoutMs = 15000 } = {}) {
     }
   } catch {}
 
-  // 2) API global (invisible)
   try {
     await page.evaluate(async () => {
       // @ts-ignore
@@ -402,7 +404,6 @@ async function solveTurnstile(page, { timeoutMs = 15000 } = {}) {
     });
   } catch {}
 
-  // 3) Esperas no-bloqueantes
   const ok = await Promise.race([
     page.waitForFunction(() => {
       const t1 = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
@@ -466,7 +467,7 @@ async function activateStartButton(page) {
   return finalEnabled && !finalDisabled;
 }
 
-/* ====== ESPERAR PROCESADO DE SUBIDA (con diagnóstico) ====== */
+/* ====== ESPERAR PROCESADO DE SUBIDA ====== */
 async function waitUploadProcessed(page, { totalTimeout = UPLOAD_TOTAL_TIMEOUT, stuckTimeout = UPLOAD_STUCK_TIMEOUT } = {}) {
   console.log("⏳ Esperando a que Riverside procese el archivo…");
   const t0 = Date.now();
@@ -555,14 +556,12 @@ async function dumpUploadDiagnosis(page) {
 /* ================== ESPERA Y DESCARGA SIN DELAYS ====================== */
 /* ===================================================================== */
 
-/* ====== Botones objetivo ====== */
 const BTN_TRANSLATE = [/^Translate$/i, /^Translate text$/i, /^Traducir$/i, /^Traducir texto$/i];
 const BTN_DOWNLOAD  = [/^Download$/i, /^Descargar$/i, /^Export$/i, /^Exportar$/i];
 const MENU_TRANSCRIPT = [/^Transcript$/i, /^Transcripci[oó]n$/i];
 
-/* ====== Espera hasta que AMBOS botones estén listos (sin sleeps) ====== */
 async function waitForTranslateAndDownloadReady(page, { timeoutMs = 0 } = {}) {
-  // timeoutMs = 0 → sin límite (espera indefinida hasta cumplirse la condición)
+  // timeoutMs = 0 → espera indefinida hasta que ambos estén visibles/habilitados
   const ok = await page.waitForFunction(
     ({ BTN_TRANSLATE, BTN_DOWNLOAD }) => {
       function isVisibleEnabled(el) {
@@ -611,7 +610,6 @@ async function waitForTranslateAndDownloadReady(page, { timeoutMs = 0 } = {}) {
   return ok;
 }
 
-/* ====== Click seguro por regex (ARIA + fallback DOM) ====== */
 async function clickButtonByRegexes(page, regexes) {
   // 1) ARIA-first
   for (const re of regexes) {
@@ -620,7 +618,7 @@ async function clickButtonByRegexes(page, regexes) {
       try { await btn.click({ timeout: 15000 }); return true; } catch {}
     }
   }
-  // 2) Fallback DOM sin sleeps
+  // 2) Fallback DOM
   const clicked = await page.evaluate(({ regexes }) => {
     function isVisibleEnabled(el) {
       if (!el) return false;
@@ -660,11 +658,10 @@ async function clickButtonByRegexes(page, regexes) {
   return clicked;
 }
 
-/* ====== Descarga “Transcript/Transcripción” escuchando el evento download ====== */
 async function downloadTranscriptFromMenuI18N(page, {
   outName = "video.txt",
   destDir = os.tmpdir(),
-  timeoutMs = 0, // sin límite por defecto
+  timeoutMs = 0, // espera indefinida al evento download
 } = {}) {
   const outPath = path.join(destDir, outName);
 
@@ -672,7 +669,7 @@ async function downloadTranscriptFromMenuI18N(page, {
   const opened = await clickButtonByRegexes(page, BTN_DOWNLOAD);
   if (!opened) throw new Error("No pude abrir el menú de descarga.");
 
-  // Espera ítem Transcript/Transcripción y dispara la descarga SIN sleeps
+  // Espera ítem Transcript/Transcripción y dispara la descarga
   const [download] = await Promise.all([
     page.waitForEvent("download", { timeout: timeoutMs }),
     (async () => {
@@ -714,11 +711,64 @@ async function downloadTranscriptFromMenuI18N(page, {
   return outPath;
 }
 
+/* ==================== SNAPSHOT DEL DOM ==================== */
+async function dumpFullDOM(page, label = "DOM_SNAPSHOT", {
+  saveToFile = true,
+  fileName = null,
+  dir = os.tmpdir(),
+} = {}) {
+  try {
+    const html = await page.content();
+    const stamp = Date.now();
+    const fname = fileName || `riverside_dom_${stamp}.html`;
+    if (saveToFile) {
+      const out = path.join(dir, fname);
+      try { fs.writeFileSync(out, html); console.log(`💾 ${label}: guardado en ${out}`); } catch (e) {
+        console.log(`⚠️ No se pudo guardar DOM en disco: ${e.message}`);
+      }
+    }
+    console.log(`\n===== ${label} (length=${html.length}) =====\n${html}\n===== END ${label} =====\n`);
+  } catch (e) {
+    console.log(`⚠️ dumpFullDOM error: ${e.message}`);
+  }
+}
+
+/* ==================== ESPERA ACTIVA HASTA "READY!" ==================== */
+async function waitForReadyUI(page, { timeoutMs = READY_WAIT_TIMEOUT_MS, dumpOnReady = true } = {}) {
+  console.log("⏳ Esperando a que la transcripción llegue a estado Ready!…");
+  const ok = await page
+    .waitForFunction(() => {
+      const bodyText = (document.body.textContent || "").toLowerCase();
+      const hasReadyText = bodyText.includes("ready!") ||
+                           bodyText.includes("your transcripts are ready") ||
+                           bodyText.includes("transcripts are ready") ||
+                           bodyText.includes("listo") ||
+                           bodyText.includes("tus transcripciones están listas");
+      const hasDownloadBtn = !!Array.from(document.querySelectorAll("button,a,[role='button']"))
+        .find(n => /^(download|descargar|export|exportar)$/i.test((n.textContent || n.getAttribute("aria-label") || "").trim()));
+      const hasFileRow = !!Array.from(document.querySelectorAll("div,span,li"))
+        .find(n => /\.(mp3|wav|m4a|mp4|mov|mkv)$/i.test((n.textContent || "").trim()));
+      const step5 = document.querySelector(".step5-active, .ts-ready-wrapper, .tr-ready-heading");
+      return hasReadyText || (hasDownloadBtn && hasFileRow) || !!step5;
+    }, { timeout: timeoutMs, polling: 800 })
+    .then(() => true)
+    .catch(() => false);
+
+  if (!ok) {
+    console.log("⚠️ Timeout esperando estado Ready!");
+    return false;
+  }
+  console.log("✅ Detectado estado Ready!");
+  if (dumpOnReady) await dumpFullDOM(page, "DOM_READY_STATE", { saveToFile: true });
+  return true;
+}
+
 /* ==================== FLUJO PRINCIPAL ==================== */
 async function transcribeFromTmpOrPath({
   mediaPath = null,
   keepOpen = true,
   useUndetectableBrowser = false,
+  postStartDomDumpSec = 10,   // dump intermedio opcional a los N segundos
 } = {}) {
   // 1) Resolver archivo
   let resolved = mediaPath && fs.existsSync(mediaPath) ? mediaPath : null;
@@ -819,17 +869,22 @@ async function transcribeFromTmpOrPath({
       const startBtn = page.locator("#start-transcribing, button:has-text('Start transcribing')").first();
       await startBtn.click({ timeout: 5000 }).catch(()=>{});
       console.log("🚀 Transcripción iniciada");
+
+      // Dump intermedio opcional (a los N s desde el inicio)
+      if (postStartDomDumpSec > 0) {
+        console.log(`⏳ Esperando ${postStartDomDumpSec}s tras iniciar para volcar DOM intermedio…`);
+        await page.waitForTimeout(postStartDomDumpSec * 1000);
+        await dumpFullDOM(page, `DOM_${postStartDomDumpSec}s_AFTER_START`, { saveToFile: true });
+      }
     } else {
       console.log("ℹ️ No se pudo activar Start (continuamos igualmente).");
     }
 
-    /* ====== 8) Esperar *sin delays* a que estén listos ambos botones ====== */
-    const bothReady = await waitForTranslateAndDownloadReady(page, { timeoutMs: 0 }); // 0 = sin límite
-    if (!bothReady) {
-      return { ok: false, reason: "buttons_not_ready" };
-    }
+    // 8) Espera ACTIVA a "Ready!" (no seguimos hasta que aparezca esa UI)
+    const readyOk = await waitForReadyUI(page, { timeoutMs: READY_WAIT_TIMEOUT_MS, dumpOnReady: true });
+    if (!readyOk) return { ok: false, reason: "ready_timeout" };
 
-    /* ====== 9) Descargar Transcript/Transcripción (sin delays) ====== */
+    // 9) Descargar Transcript/Transcripción
     savedPath = await downloadTranscriptFromMenuI18N(page, {
       outName: "video.txt",
       destDir: os.tmpdir(),
@@ -862,5 +917,8 @@ async function transcribeFromTmpOrPath({
 module.exports = {
   transcribeFromTmpOrPath,
   findLatestMedia,
+  findLatestMp3,
   createRiversideBrowser,
+  dumpFullDOM,
+  waitForReadyUI,
 };
