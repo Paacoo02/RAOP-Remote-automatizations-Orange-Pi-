@@ -9,7 +9,6 @@ puppeteer.use(StealthPlugin());
 const {
   attemptGoogleLogin,
   switchToVideosTab,
-  downloadAndTrashFile,          // fallback (via fileId)
   downloadAndTrashFileViaMenu,   // preferido (menu Download)
   FIXED_FOLDER_URL
 } = require('./auto_log_in.js');
@@ -28,6 +27,101 @@ const PASS  = process.env.GOOGLE_PASS  || '392002Planes0.';
 
 function isOAuthLikeUrl(u = '') {
   return /accounts\.google\.com|ServiceLogin|signin|oauth|consent|gsi|challenge\/pwd/i.test(u);
+}
+
+// Click robusto por texto, cubre button y role=button, también dentro de iframes
+async function clickByTextAcrossFrames(page, texts = [], { timeout = 8000 } = {}) {
+  const pagesOrFrames = [page, ...(page.frames?.() || [])];
+  const quoted = (t) => t.replace(/"/g, '\\"');
+
+  const selectors = (txt) => [
+    `button:has-text("${quoted(txt)}")`,
+    `div[role="button"]:has-text("${quoted(txt)}")`,
+    `span[role="button"]:has-text("${quoted(txt)}")`,
+    // Botón de los templates Material:
+    `[jsname="LgbsSe"]:has-text("${quoted(txt)}")`,
+  ];
+
+  for (const ctx of pagesOrFrames) {
+    for (const t of texts) {
+      const loc = ctx.locator?.(selectors(t).join(', '))?.first?.();
+      if (loc && await loc.count?.()) {
+        try { await loc.scrollIntoViewIfNeeded?.(); } catch {}
+        try { await loc.waitFor?.({ state: 'visible', timeout }); } catch {}
+        try { await loc.click?.({ delay: 20 }); return true; } catch {}
+      }
+    }
+  }
+  return false;
+}
+
+async function ensureVisibleAndFocused(p) {
+  try { await p.bringToFront?.(); } catch {}
+  try { await p.setViewportSize?.({ width: 1200, height: 900 }); } catch {}
+  try { await p.evaluate?.(() => window.focus?.()); } catch {}
+}
+
+// Paso a paso del consentimiento, reintentando en la MISMA ventana hasta que termine
+async function stepThroughConsent(p, { rounds = 6 } = {}) {
+  const ALLOW_TXT = ['Allow','Permitir'];
+  const CONT_TXT  = ['Continue','Continuar'];
+  const ADV_TXT   = ['Advanced','Avanzadas','Avanzado','Avanzada'];
+  const UNSAFE_TXT= ['Go to','Ir a'];
+
+  for (let i = 0; i < rounds; i++) {
+    await ensureVisibleAndFocused(p);
+
+    // “Advanced / Avanzadas” → “Go to … (unsafe) / Ir a …”
+    let clicked = await clickByTextAcrossFrames(p, ADV_TXT, { timeout: 2000 });
+    if (clicked) {
+      console.log('⚠️ Pulsado "Advanced/Avanzadas".');
+      await p.waitForLoadState?.('domcontentloaded', { timeout: 15000 }).catch(()=>{});
+      await p.waitForLoadState?.('networkidle', { timeout: 15000 }).catch(()=>{});
+      // Intento “Go to … (unsafe) / Ir a …”
+      await clickByTextAcrossFrames(p, UNSAFE_TXT, { timeout: 3000 }).catch(()=>{});
+      await p.waitForLoadState?.('domcontentloaded', { timeout: 15000 }).catch(()=>{});
+      await p.waitForLoadState?.('networkidle', { timeout: 15000 }).catch(()=>{});
+    }
+
+    // “Allow / Permitir”
+    clicked = await clickByTextAcrossFrames(p, ALLOW_TXT, { timeout: 3000 });
+    if (clicked) {
+      console.log(`➡️ Consent (Allow/Permitir) #${i + 1}`);
+      await p.waitForLoadState?.('domcontentloaded', { timeout: 15000 }).catch(()=>{});
+      await p.waitForLoadState?.('networkidle', { timeout: 15000 }).catch(()=>{});
+    }
+
+    // “Continue / Continuar”
+    let contClicked = await clickByTextAcrossFrames(p, CONT_TXT, { timeout: 2500 });
+    if (contClicked) {
+      console.log(`➡️ Consent (Continue/Continuar) #${i + 1}`);
+      await p.waitForLoadState?.('domcontentloaded', { timeout: 15000 }).catch(()=>{});
+      await p.waitForLoadState?.('networkidle', { timeout: 15000 }).catch(()=>{});
+    }
+
+    // Si no clicamos nada en este round, intentamos scroll (a veces habilita el botón)
+    if (!clicked && !contClicked) {
+      try {
+        await p.evaluate?.(() => { window.scrollBy(0, Math.max(400, window.innerHeight * 0.9)); });
+      } catch {}
+      // Último intento post-scroll
+      clicked = await clickByTextAcrossFrames(p, [...ALLOW_TXT, ...CONT_TXT], { timeout: 2000 });
+      if (clicked) {
+        console.log(`➡️ Consent tras scroll #${i + 1}`);
+        await p.waitForLoadState?.('domcontentloaded', { timeout: 15000 }).catch(()=>{});
+        await p.waitForLoadState?.('networkidle', { timeout: 15000 }).catch(()=>{});
+      }
+    }
+
+    // ¿Se cerró el popup o ya salimos de OAuth?
+    if (p.isClosed?.()) return true;
+    const url = typeof p.url === 'function' ? p.url() : (p.url || '');
+    if (!isOAuthLikeUrl(url)) return true;
+
+    // Pequeña espera antes del siguiente “round”
+    await p.waitForTimeout?.(700);
+  }
+  return false;
 }
 
 async function waitAndFocusConnectButton(page, timeoutMs = 60000) {
@@ -69,44 +163,75 @@ async function waitAndFocusConnectButton(page, timeoutMs = 60000) {
   return false;
 }
 
+// ⬇⬇⬇ **CLAVE**: el mismo popup puede necesitar varios consent consecutivos.
+// En lugar de marcarlo como "handled" una sola vez, lo manejamos en bucle hasta que cierre o salga de OAuth.
 async function waitForOAuthCascade(context, hostPage, handlePopupFn, {
-  windowMs = 90000, idleMs = 1500
+  windowMs = 120000, idleMs = 2000
 } = {}) {
-  const handled = new Set();
   const deadline = Date.now() + windowMs;
   let lastActivity = Date.now();
 
-  const onPage = (p) => {};
-  context.on?.('page', onPage);
-  try {
-    while (Date.now() < deadline) {
-      const candidates = (await context.pages?.())?.filter(p => p && !p.isClosed?.() && p !== hostPage && !handled.has(p)) || [];
-      let popup = null;
-      for (const p of candidates) {
-        try { await p.waitForLoadState?.('domcontentloaded', { timeout: 12000 }).catch(()=>{}); } catch {}
-        const url = typeof p.url === 'function' ? p.url() : (p.url || '');
-        if (isOAuthLikeUrl(url)) { popup = p; break; }
-      }
-      if (!popup) {
-        if (Date.now() - lastActivity >= idleMs) break;
-        await sleep(200);
-        continue;
-      }
-      handled.add(popup);
-      await popup.bringToFront?.().catch(()=>{});
-      await handlePopupFn(popup);
-      await Promise.race([
-        new Promise(res => popup.once?.('close', res)),
-        popup.waitForURL?.(u => /colab\.research\.google\.com/i.test(u), { timeout: 20000 }).catch(()=>{})
-      ]);
-      lastActivity = Date.now();
+  const isAliveOAuth = (p) => {
+    if (!p || p.isClosed?.()) return false;
+    try {
+      const u = typeof p.url === 'function' ? p.url() : (p.url || '');
+      return isOAuthLikeUrl(u);
+    } catch { return false; }
+  };
+
+  while (Date.now() < deadline) {
+    const pages = (await context.pages?.()) || [];
+    // Prioriza cualquier popup OAuth que no sea la hostPage
+    const oauthPopups = pages.filter(p => p && p !== hostPage && isAliveOAuth(p));
+
+    if (!oauthPopups.length) {
+      // Si no hay actividad, vamos cerrando el loop
+      if (Date.now() - lastActivity >= idleMs) break;
+      await sleep(200);
+      continue;
     }
-  } finally {
-    context.off?.('page', onPage);
+
+    for (const popup of oauthPopups) {
+      try {
+        await ensureVisibleAndFocused(popup);
+        // Maneja email/password y *todos* los consents necesarios dentro de ESTE popup
+        await handlePopupFn(popup);
+
+        // Espera a que el popup cierre o a que la URL deje de ser OAuth
+        const finished = await Promise.race([
+          new Promise(res => popup.once?.('close', () => res(true))),
+          (async () => {
+            let done = false;
+            // Pequeño loop de observación de URL
+            for (let i = 0; i < 10; i++) {
+              await popup.waitForTimeout?.(500);
+              if (!isAliveOAuth(popup)) { done = true; break; }
+            }
+            return done;
+          })()
+        ]);
+        lastActivity = Date.now();
+
+        // Si no ha terminado (sigue siendo OAuth y no se cerró), repetimos el manejo del MISMO popup
+        if (!finished && isAliveOAuth(popup)) {
+          // Pequeña pausa antes de volver a intentar
+          await popup.waitForTimeout?.(500);
+          await handlePopupFn(popup);
+        }
+      } catch (e) {
+        // Si falla, no detenemos el cascade; pasamos al siguiente
+        // console.warn('waitForOAuthCascade warn:', e?.message);
+      }
+    }
   }
 }
 
 async function handleOAuthPopupByEmailOrForm(p) {
+  try {
+    await ensureVisibleAndFocused(p);
+  } catch {}
+
+  // 1) Selección de cuenta por chip/botón con el email
   try {
     let candidate = p.locator?.(`[data-email="${EMAIL}"]`)?.first?.();
     if (!(await candidate?.count?.())) {
@@ -116,9 +241,11 @@ async function handleOAuthPopupByEmailOrForm(p) {
       await candidate.scrollIntoViewIfNeeded?.().catch(()=>{});
       await candidate.click?.();
       console.log(`🟢 Cuenta seleccionada por email: ${EMAIL}`);
+      await p.waitForLoadState?.('domcontentloaded', { timeout: 12000 }).catch(()=>{});
     }
   } catch {}
 
+  // 2) Email + Password clásicos
   try {
     const emailBox = p.locator?.('#identifierId:visible, input[name="identifier"]:visible, input[type="email"]:visible')?.first?.();
     if (emailBox && await emailBox.count?.()) {
@@ -128,6 +255,7 @@ async function handleOAuthPopupByEmailOrForm(p) {
       const nextId = p.locator?.('#identifierNext:visible, div[role="button"]:has-text("Next"):visible, div[role="button"]:has-text("Siguiente"):visible')?.first?.();
       if (nextId && await nextId.count?.()) await nextId.click?.();
       else await p.keyboard?.press('Enter').catch(()=>{});
+      await p.waitForLoadState?.('domcontentloaded', { timeout: 15000 }).catch(()=>{});
     }
 
     await Promise.race([
@@ -144,21 +272,14 @@ async function handleOAuthPopupByEmailOrForm(p) {
       if (nextPwd && await nextPwd.count?.()) await nextPwd.click?.();
       else await p.keyboard?.press('Enter').catch(()=>{});
       console.log('🟢 Password enviado (popup).');
+      await p.waitForLoadState?.('domcontentloaded', { timeout: 15000 }).catch(()=>{});
     }
   } catch {}
 
-  for (let i = 0; i < 6; i++) {
-    try {
-      const cont = p.locator?.('button:has-text("Continue"), button:has-text("Continuar"), button:has-text("Allow"), button:has-text("Permitir")')?.first?.();
-      if (!cont || !(await cont.count?.())) break;
-      await cont.waitFor?.({ state: 'visible', timeout: 15000 });
-      await cont.click?.();
-      await p.waitForTimeout?.(700);
-      console.log(`➡️ Consent #${i + 1}`);
-    } catch {
-      break;
-    }
-  }
+  // 3) Consents encadenados (MISMA ventana)
+  try {
+    await stepThroughConsent(p, { rounds: 8 });
+  } catch {}
 }
 
 async function openRuntimeMenu(page) {
@@ -380,27 +501,6 @@ async function waitForCloudflareLinkOrTrueInCell(page, idx = 2, { timeoutMs = 30
   return handle?.jsonValue?.();
 }
 
-/* === Helper: reintentar descarga hasta 10s === */
-async function retryDownloadWithGrace(videosTab, filename, { destDir, maxWaitMs = 10000, stepMs = 1000 } = {}) {
-  const t0 = Date.now();
-  let lastErr = null;
-  while (Date.now() - t0 < maxWaitMs) {
-    try {
-      // 1) INTENTO PRINCIPAL: menú “Descargar” (no requiere fileId)
-      return await downloadAndTrashFileViaMenu(videosTab, filename, { destDir });
-    } catch (e1) {
-      lastErr = e1;
-      // 2) INTENTO SECUNDARIO: método antiguo por fileId (uc?export=download)
-      try {
-        return await downloadAndTrashFile(videosTab, filename, { destDir });
-      } catch (e2) {
-        lastErr = e2;
-      }
-      await sleep(stepMs);
-    }
-  }
-  throw lastErr || new Error(`Timeout esperando "${filename}" en Drive.`);
-}
 
 /* ---------------- Flujo principal ---------------- */
 
@@ -486,7 +586,8 @@ async function drive_auto({ context: injectedContext, drivePage: injectedDrivePa
   await colabPage.keyboard?.press('Enter');
   console.log('↩️ ENTER enviado al diálogo.');
 
-  await waitForOAuthCascade(context, colabPage, handleOAuthPopupByEmailOrForm, { windowMs: 90000, idleMs: 1500 });
+  // ⬇ Manejo de popups OAuth con reintentos sobre la MISMA ventana
+  await waitForOAuthCascade(context, colabPage, handleOAuthPopupByEmailOrForm, { windowMs: 120000, idleMs: 2000 });
   await colabPage.bringToFront?.();
   console.log('🕰️ Esperando montaje /content/drive…');
 
@@ -507,17 +608,65 @@ async function drive_auto({ context: injectedContext, drivePage: injectedDrivePa
   }
 
   if (outcome?.kind === 'true') {
-    console.log('🟢 Notebook devolvió True → procederemos a descargar video.mp3 tras una gracia de hasta 10s.');
+    console.log('🟢 Notebook devolvió True → procederemos a descargar video.mp3 (método: menú “Descargar”).');
+  
     const videosTab = await switchToVideosTab(context);
     await videosTab?.bringToFront?.().catch(()=>{});
     try { await videosTab?.waitForLoadState?.('domcontentloaded', { timeout: 10000 }); } catch {}
-    const dlInfo = await retryDownloadWithGrace(
-      videosTab,
-      'video.mp3',
-      { destDir: (typeof os?.tmpdir === 'function' ? os.tmpdir() : '/tmp'), maxWaitMs: 10000, stepMs: 1000 }
-    );
+  
+    let dlInfo = null;
+    let savedPath = null;
+    let browser = null;
+  
+    try {
+      console.log("Hemos llegado a la zona crítica");
+      dlInfo = await downloadAndTrashFileViaMenu(
+        videosTab,
+        'video.mp3',
+        { destDir: (typeof os?.tmpdir === 'function' ? os.tmpdir() : '/tmp'), timeoutMs: 120000 }
+      );
+      savedPath = dlInfo?.path || null;
+      console.log('✅ Descarga completada por menú:', savedPath);
+    } catch (err) {
+      console.warn('⚠️ Falló método por menú, intentando método antiguo como fallback:', err.message);
+      try {
+        const { downloadAndTrashFile } = require('./auto_log_in.js');
+        dlInfo = await downloadAndTrashFile(
+          videosTab,
+          'video.mp3',
+          { destDir: (typeof os?.tmpdir === 'function' ? os.tmpdir() : '/tmp'), timeoutMs: 120000 }
+        );
+        savedPath = dlInfo?.path || null;
+        console.log('✅ Descarga completada por método antiguo:', savedPath);
+      } catch (e2) {
+        console.error('❌ Falló también el método antiguo:', e2.message);
+        throw e2;
+      }
+    } finally {
+      // 🔒 Cerrar navegador/contexto solo si realmente se descargó algo
+      if (savedPath) {
+        try {
+          console.log('🧹 Cerrando contexto Playwright...');
+          await context.close();
+        } catch (closeErr) {
+          console.warn('⚠️ Error al cerrar contexto:', closeErr.message);
+        }
+  
+        try {
+          browser = context.browser?.() || context._browser || null;
+          if (browser) {
+            await browser.close();
+            console.log('✅ Navegador cerrado correctamente.');
+          }
+        } catch (closeErr) {
+          console.warn('⚠️ Error al cerrar navegador:', closeErr.message);
+        }
+      }
+    }
+  
     return { result: true, download: dlInfo, page: colabPage, context };
   }
+  
 
   // Ni link ni True → no seguimos
   throw new Error('No se obtuvo enlace de Cloudflare ni "True" en la celda 3.');

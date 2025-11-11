@@ -42,9 +42,10 @@ async function createUndetectableBrowser() {
     args: [
       '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
       '--disable-background-timer-throttling','--disable-renderer-backgrounding',
-      '--mute-audio','--disable-gpu','--disable-quic','--no-first-run',
-      '--no-default-browser-check','--window-size=1920,1080',
+      '--mute-audio','--no-first-run','--no-default-browser-check',
+      '--window-size=1920,1080','--start-maximized',
       '--force-dark-mode','--enable-features=WebUIDarkMode',
+      '--disable-quic'
     ],
     ignoreDefaultArgs: ['--enable-automation'],
     viewport: { width: 1920, height: 1080 },
@@ -778,6 +779,38 @@ async function clickDownloadInMenu(page) {
   console.log('⬇️  Click en "Descargar" (menú).');
 }
 
+async function downloadAndTrashFile(page, fileName, { destDir = os.tmpdir(), timeoutMs = 120000 } = {}) {
+  await waitForDriveReady(page);
+  const row = await findRowByName(page, fileName);
+  if (!row) throw new Error(`No se encontró "${fileName}" en la carpeta.`);
+  const fileId = await ensureFileIdFromRow(page, row);
+  if (!fileId) throw new Error(`No se pudo obtener fileId de "${fileName}".`);
+
+  const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
+  console.log(`⬇️ Descargando "${fileName}" desde ${url}`);
+
+  const [download] = await Promise.all([
+    page.waitForEvent('download', { timeout: timeoutMs }),
+    page.evaluate(u => { const a = document.createElement('a'); a.href = u; a.target = '_blank'; a.rel='noopener'; document.body.appendChild(a); a.click(); a.remove(); }, url)
+  ]);
+
+  const suggested = download.suggestedFilename();
+  const targetPath = path.join(destDir, suggested || fileName);
+  await download.saveAs(targetPath);
+  console.log('💾 Guardado en:', targetPath);
+
+  // Limpieza: enviar a papelera el .mp3
+  await trashExistingFile(page, fileName).catch(()=>{});
+  console.log(`🗑️ "${fileName}" enviado a la papelera en Drive.`);
+
+  return { path: targetPath, fileId };
+}
+
+/** Alias compatible; siempre carpeta fija u/1 */
+async function uploadFileToDriveUI(filePath, opts = {}) {
+  return uploadFileToSpecificFolderUI(filePath, opts);
+}
+
 async function downloadAndTrashFileViaMenu(page, fileName, { destDir = os.tmpdir(), timeoutMs = 120000 } = {}) {
   await waitForDriveReady(page);
 
@@ -817,11 +850,6 @@ async function downloadAndTrashFileViaMenu(page, fileName, { destDir = os.tmpdir
   console.log(`🗑️ "${fileName}" enviado a la papelera.`);
 
   return { path: targetPath, fileId: null, via: 'menu' };
-}
-
-/** Alias compatible; siempre carpeta fija u/1 */
-async function uploadFileToDriveUI(filePath, opts = {}) {
-  return uploadFileToSpecificFolderUI(filePath, opts);
 }
 
 module.exports = {
