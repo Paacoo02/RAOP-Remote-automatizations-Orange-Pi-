@@ -73,8 +73,8 @@ COPY . .
 
 # 🔧 Normaliza los finales de línea y asegura permisos de ejecución
 RUN find /app -type f -name "*.sh" -exec dos2unix {} \; && \
-    chmod +x /app/*.sh
-
+    find /app -type f -name "*.sh" -exec chmod +x {} \;
+    
 EXPOSE 22 6080 5901 3001
 
 # ======================================================
