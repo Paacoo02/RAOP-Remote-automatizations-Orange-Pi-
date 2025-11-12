@@ -1,72 +1,134 @@
+// Fichero: content.js
+
 // Inyecta el hook en MAIN world para este frame
 chrome.runtime.sendMessage({ type: 'ensureHook' }).catch(()=>{});
 
-// Reenvía hallazgos del hook MAIN->SW
-window.addEventListener('message', (ev) => {
-  const d = ev.data;
-  if (!d || !d.__VIDHOOK__ || d.kind !== 'video') return;
-  chrome.runtime.sendMessage({
-    type: 'videoFound',
-    url: String(d.url || ''),
-    via: d.via || 'hook',
-    frameUrl: location.href,
-    meta: d.meta || null
-  }).catch(()=>{});
-}, false);
-
 // ---------- Helpers proveedor/thumbnail ----------
-function ytIdFromHere() {
+function ytIdFromURL(u) {
+  if (!u) return null;
   try {
-    const u = new URL(location.href);
-    if (u.hostname.endsWith('youtube.com')) {
-      if (u.pathname.startsWith('/embed/')) return u.pathname.split('/')[2] || null;
-      if (u.pathname.startsWith('/shorts/')) return u.pathname.split('/')[2] || null;
-      if (u.pathname === '/watch') return u.searchParams.get('v');
+    const url = new URL(u);
+    if (!url.hostname.endsWith('youtube.com')) return null;
+    if (url.pathname.startsWith('/embed/'))  return url.pathname.split('/')[2] || null;
+    if (url.pathname.startsWith('/shorts/')) return url.pathname.split('/')[2] || null;
+    if (url.pathname === '/watch')           return url.searchParams.get('v');
+  } catch {}
+  return null;
+}
+function vimeoIdFromURL(u) {
+  try {
+    const url = new URL(u);
+    if (url.hostname === 'player.vimeo.com' && url.pathname.startsWith('/video/')) {
+      return url.pathname.split('/')[2] || null;
     }
   } catch {}
   return null;
 }
-function providerMetaFromHere() {
-  const y = ytIdFromHere();
-  if (y) return { provider: 'yt', providerId: y, thumb: `https://img.youtube.com/vi/${y}/hqdefault.jpg` };
-  // (Vimeo/Dailymotion pueden añadirse; miniaturas requieren API pública, aquí dejamos provider/id para deduplicar)
+function dmIdFromURL(u) {
   try {
-    const u = new URL(location.href);
-    if (u.hostname === 'player.vimeo.com' && u.pathname.startsWith('/video/')) {
-      return { provider: 'vimeo', providerId: u.pathname.split('/')[2] || null };
-    }
-    if (u.hostname === 'www.dailymotion.com' && u.pathname.startsWith('/embed/video/')) {
-      return { provider: 'dm', providerId: u.pathname.split('/')[3] || null };
+    const url = new URL(u);
+    if (url.hostname === 'www.dailymotion.com' && url.pathname.startsWith('/embed/video/')) {
+      return url.pathname.split('/')[3] || null;
     }
   } catch {}
   return null;
+}
+
+/**
+ * Devuelve meta { provider, providerId, thumb? } tomando primero location.href
+ * y si no hay id (p. ej. frame interno de YouTube), intenta con document.referrer.
+ */
+function providerMetaFromHere() {
+  // 1) location.href
+  let id = ytIdFromURL(location.href);
+  if (id) return { provider: 'yt', providerId: id, thumb: `https://img.youtube.com/vi/${id}/hqdefault.jpg` };
+
+  let vimeo = vimeoIdFromURL(location.href);
+  if (vimeo) return { provider: 'vimeo', providerId: vimeo };
+
+  let dm = dmIdFromURL(location.href);
+  if (dm) return { provider: 'dm', providerId: dm };
+
+  // 2) fallback: document.referrer (clave para frames internos /s/player/… de YouTube)
+  try {
+    if (document.referrer) {
+      id = ytIdFromURL(document.referrer);
+      if (id) return { provider: 'yt', providerId: id, thumb: `https://img.youtube.com/vi/${id}/hqdefault.jpg` };
+
+      vimeo = vimeoIdFromURL(document.referrer);
+      if (vimeo) return { provider: 'vimeo', providerId: vimeo };
+
+      dm = dmIdFromURL(document.referrer);
+      if (dm) return { provider: 'dm', providerId: dm };
+    }
+  } catch {}
+
+  return null;
+}
+
+/**
+ * Intenta resolver una URL relativa (ej: "/video.mp4") a una URL absoluta
+ * usando la ubicación actual del documento.
+ */
+function resolveUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  // Si ya es absoluta, devolverla
+  if (url.startsWith('http:') || url.startsWith('https:') || url.startsWith('blob:') || url.startsWith('data:')) {
+    return url;
+  }
+  // Si es relativa al protocolo (ej: //google.com)
+  if (url.startsWith('//')) {
+    return location.protocol + url;
+  }
+  // Resolverla usando la base del documento
+  try {
+    return new URL(url, location.href).href;
+  } catch {
+    return url; // fallback
+  }
 }
 
 function captureThumbIfPossible(v) {
   try {
-    // 1) poster del <video>
     const poster = v.getAttribute('poster');
-    if (poster) return { thumb: poster };
-
-    // 2) snapshot (CORS puede bloquear). Escala a ancho 320 px.
-    if (v.videoWidth && v.videoHeight && v.readyState >= 2) {
+    // Usar el poster si existe
+    if (poster) return { thumb: resolveUrl(poster) };
+    
+    // Si no, intentar capturar un fotograma del vídeo
+    if (v.videoWidth && v.videoHeight && v.readyState >= 2) { // 2 = HAVE_METADATA
       const ratio = v.videoWidth / v.videoHeight;
       const w = 320, h = Math.max(1, Math.round(w / ratio));
       const c = document.createElement('canvas'); c.width = w; c.height = h;
-      const ctx = c.getContext('2d');
-      ctx.drawImage(v, 0, 0, w, h);
+      c.getContext('2d').drawImage(v, 0, 0, w, h);
       const data = c.toDataURL('image/jpeg', 0.6);
-      // límite ~300KB para no saturar
-      if (data.length < 350000) return { thumb: data };
+      if (data.length < 350000) return { thumb: data }; // Evitar dataURIs enormes
     }
-  } catch { /* CORS/DRM */ }
+  } catch (e) {
+    // A veces falla por CORS al pintar en el canvas
+    console.warn('Fallo al capturar thumbnail', e);
+  }
   return {};
 }
+
+// ---------- Puente MAIN->SW (fusiona meta del proveedor SIEMPRE) ----------
+window.addEventListener('message', (ev) => {
+  const d = ev.data;
+  if (!d || !d.__VIDHOOK__ || d.kind !== 'video') return;
+  const prov = providerMetaFromHere();
+  const meta = { ...(d.meta || {}), ...(prov || {}) };
+  chrome.runtime.sendMessage({
+    type: 'videoFound',
+    url: resolveUrl(String(d.url || '')), // Resolver URL siempre
+    via: d.via || 'hook',
+    frameUrl: location.href,
+    meta
+  }).catch(()=>{});
+}, false);
 
 // ---------- Estado de los <video> ----------
 function snapshot(v) {
   return {
-    url: v.currentSrc || v.src || '',
+    url: resolveUrl(v.currentSrc || v.src || ''),
     paused: v.paused,
     muted: v.muted,
     volume: v.volume,
@@ -96,46 +158,173 @@ function wireVideo(v) {
     chrome.runtime.sendMessage({ type: 'videoState', state, meta }).catch(()=>{});
   };
 
-  v.addEventListener('loadedmetadata', () => send(true), { passive: true });
-  v.addEventListener('play', () => send(false), { passive: true });
-  v.addEventListener('pause', () => send(false), { passive: true });
-  v.addEventListener('ended', () => send(false), { passive: true });
+  // El vídeo ya puede tener metadatos, hacer una captura inicial
+  if (v.readyState >= 2) {
+    send(true);
+  } else {
+    // Si no, esperar a que carguen los metadatos para la miniatura
+    v.addEventListener('loadedmetadata', () => send(true),  { passive:true, once: true });
+  }
 
-  // primer snapshot + intento de miniatura
-  setTimeout(() => send(true), 0);
+  // Escuchar eventos de reproducción
+  v.addEventListener('play',            () => send(false), { passive:true });
+  v.addEventListener('pause',           () => send(false), { passive:true });
+  v.addEventListener('ended',           () => send(false), { passive:true });
+
+  // Envío inicial por si acaso
+  setTimeout(() => send(false), 0);
 }
 
-// Escaneo inicial + mutaciones
+// ---------- Escaneo inicial + mutaciones ----------
+
+// Para evitar envíos duplicados de 'videoFound' para la misma URL
+const sentUrls = new Set();
+
 function scanOnce() {
   try {
+    const prov = providerMetaFromHere();
+
     document.querySelectorAll('video').forEach(v => {
-      wireVideo(v);
-      const u = v.currentSrc || v.src; if (u) chrome.runtime.sendMessage({ type:'videoFound', url:String(u), via:'video-tag', frameUrl: location.href, meta: providerMetaFromHere()||null }).catch(()=>{});
-      v.querySelectorAll('source').forEach(s => s.src && chrome.runtime.sendMessage({ type:'videoFound', url:String(s.src), via:'source-tag', frameUrl: location.href, meta: providerMetaFromHere()||null }).catch(()=>{}));
+      wireVideo(v); // Asignar listeners
+      const u = resolveUrl(String(v.currentSrc || v.src));
+      if (u && !sentUrls.has(u)) {
+        sentUrls.add(u);
+        chrome.runtime.sendMessage({ type:'videoFound', url:u, via:'video-tag', frameUrl: location.href, meta: {...prov, ...captureThumbIfPossible(v)} }).catch(()=>{});
+      }
+      
+      v.querySelectorAll('source').forEach(s => {
+        const uSrc = resolveUrl(String(s.src));
+        if (uSrc && !sentUrls.has(uSrc)) {
+          sentUrls.add(uSrc);
+          chrome.runtime.sendMessage({ type:'videoFound', url:uSrc, via:'source-tag', frameUrl: location.href, meta: prov||null }).catch(()=>{});
+        }
+      });
     });
 
-    // Embeds visibles desde este frame (p.ej. el frame padre)
-    document.querySelectorAll('iframe[src]').forEach(ifr => {
-      const s = String(ifr.getAttribute('src')||'');
-      // YouTube → añade meta con thumb directa
-      const y = (()=>{ try{ const u=new URL(s); if (u.hostname.endsWith('youtube.com')) { if (u.pathname.startsWith('/embed/')) return u.pathname.split('/')[2]||null; if (u.pathname==='/watch') return u.searchParams.get('v'); if (u.pathname.startsWith('/shorts/')) return u.pathname.split('/')[2]||null; } }catch{} return null; })();
-      if (y) chrome.runtime.sendMessage({ type:'videoFound', url:s, via:'embed-youtube', frameUrl: location.href, meta: { provider:'yt', providerId:y, thumb:`https://img.youtube.com/vi/${y}/hqdefault.jpg` }});
+    // ### CAMBIO 1: El selector ahora es 'iframe' (no 'iframe[src]') ###
+    document.querySelectorAll('iframe').forEach(ifr => {
+      const s = resolveUrl(String(ifr.getAttribute('src')||''));
+      
+      // Si el iframe no tiene 'src' todavía, no podemos hacer nada con él
+      if (!s || s.startsWith('about:blank') || s.startsWith('javascript:')) return;
 
-      const vimeo = (()=>{ try{ const u=new URL(s); if (u.hostname==='player.vimeo.com' && u.pathname.startsWith('/video/')) return u.pathname.split('/')[2]||null; }catch{} return null; })();
-      if (vimeo) chrome.runtime.sendMessage({ type:'videoFound', url:s, via:'embed-vimeo', frameUrl: location.href, meta: { provider:'vimeo', providerId:vimeo }});
+      // Evitar duplicados
+      if (sentUrls.has(s)) return;
 
-      const dm = (()=>{ try{ const u=new URL(s); if (u.hostname==='www.dailymotion.com' && u.pathname.startsWith('/embed/video/')) return u.pathname.split('/')[3]||null; }catch{} return null; })();
-      if (dm) chrome.runtime.sendMessage({ type:'videoFound', url:s, via:'embed-dailymotion', frameUrl: location.href, meta: { provider:'dm', providerId:dm }});
+      // YouTube
+      const y = ytIdFromURL(s);
+      if (y) {
+        sentUrls.add(s);
+        chrome.runtime.sendMessage({ type:'videoFound', url:s, via:'embed-youtube', frameUrl: location.href, meta: { provider:'yt', providerId:y, thumb:`https://img.youtube.com/vi/${y}/hqdefault.jpg` }});
+        return; // Es de YouTube, no lo listes genéricamente
+      }
+      
+      // Vimeo
+      const vimeo = vimeoIdFromURL(s);
+      if (vimeo) {
+        sentUrls.add(s);
+        chrome.runtime.sendMessage({ type:'videoFound', url:s, via:'embed-vimeo', frameUrl: location.href, meta: { provider:'vimeo', providerId:vimeo }});
+        return; // Es de Vimeo
+      }
+
+      // Dailymotion
+      const dm = dmIdFromURL(s);
+      if (dm) {
+        sentUrls.add(s);
+        chrome.runtime.sendMessage({ type:'videoFound', url:s, via:'embed-dailymotion', frameUrl: location.href, meta: { provider:'dm', providerId:dm }});
+        return; // Es de Dailymotion
+      }
+
+      // ### CAMBIO 2: Lógica "Catch-all" para iframes desconocidos ###
+      // Si llegamos aquí, NO es un proveedor conocido, PERO tiene un src.
+      // Lo añadimos como un vídeo genérico.
+      sentUrls.add(s);
+      chrome.runtime.sendMessage({ 
+          type:'videoFound', 
+          url:s, 
+          via:'embed-unknown', // Un nuevo 'via' genérico
+          frameUrl: location.href, 
+          meta: { ...(prov||{}), provider:'iframe' }
+      }).catch(()=>{});
+      
     });
 
     document.querySelectorAll('link[rel="preload"][as="video"]').forEach(l=>{
-      const u = l.getAttribute('href'); if (u) chrome.runtime.sendMessage({ type:'videoFound', url:String(u), via:'preload-link', frameUrl: location.href, meta: providerMetaFromHere()||null }).catch(()=>{});
+      const u = resolveUrl(String(l.getAttribute('href')));
+      if (u && !sentUrls.has(u)) {
+        sentUrls.add(u);
+        chrome.runtime.sendMessage({ type:'videoFound', url:u, via:'preload-link', frameUrl: location.href, meta: prov||null }).catch(()=>{});
+      }
     });
 
     const og = document.querySelector('meta[property="og:video"], meta[name="og:video"]');
-    if (og?.content) chrome.runtime.sendMessage({ type:'videoFound', url:String(og.content), via:'og:video', frameUrl: location.href, meta: providerMetaFromHere()||null }).catch(()=>{});
+    if (og?.content) {
+      const u = resolveUrl(String(og.content));
+      if (u && !sentUrls.has(u)) {
+        sentUrls.add(u);
+        chrome.runtime.sendMessage({ type:'videoFound', url:u, via:'og:video', frameUrl: location.href, meta: prov||null }).catch(()=>{});
+      }
+    }
+  
   } catch {}
 }
 
-new MutationObserver(scanOnce).observe(document, { childList:true, subtree:true });
-scanOnce();
+// ### CAMBIO 3: El observador ahora vigila 'attributes' SIN FILTRO ###
+// Observar cambios en atributos (como 'src') y la adición/eliminación de nodos
+new MutationObserver(scanOnce).observe(document, { 
+  childList: true,    // Vigila si se añaden/quitan elementos (ej: el iframe)
+  subtree: true,      // Vigila en todo el documento
+  attributes: true    // Vigila CUALQUIER cambio de atributo (más robusto)
+});
+scanOnce(); // Ejecutar el escaneo inicial
+
+
+// ####################################################################
+// ### INICIO DEL CÓDIGO AÑADIDO PARA EL VOLCADO DE DOM ###
+// ####################################################################
+
+// Este script escanea el DOM en busca de etiquetas <video>, <iframe>, etc.
+// y envía su HTML (outerHTML) al service worker bajo el mensaje
+// 'dbg.foundMediaElements', que es lo que querías originalmente.
+
+(function() {
+  // Usamos un guardián único para este bloque
+  if (window.myDomDebugScannerHasRun) {
+    return;
+  }
+  window.myDomDebugScannerHasRun = true;
+
+  try {
+    // 1. Buscar los elementos
+    const mediaElements = document.querySelectorAll('video, iframe, object, embed');
+    
+    // 2. Extraer su HTML (outerHTML)
+    const mediaHtmlList = [];
+    mediaElements.forEach(el => mediaHtmlList.push(el.outerHTML));
+
+    // 3. Enviar SIEMPRE el mensaje, incluso si count es 0
+    // (Esto confirma que el script se ejecutó)
+    chrome.runtime.sendMessage({ 
+      type: 'dbg.foundMediaElements', 
+      elements: mediaHtmlList, 
+      count: mediaHtmlList.length,
+      frameUrl: location.href 
+    });
+
+  } catch (e) {
+    // Enviar un error si este escáner específico falla
+    try {
+      chrome.runtime.sendMessage({ 
+        type: 'dbg.contentScriptError',
+        error: `[DomDebugScanner] ${e?.message || String(e)}`,
+        frameUrl: window.location.href
+      });
+    } catch(e2) {
+      console.error('Error en DomDebugScanner y al reportarlo:', e, e2);
+    }
+  }
+})();
+
+// ####################################################################
+// ### FIN DEL CÓDIGO AÑADIDO ###
+// ####################################################################

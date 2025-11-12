@@ -1,216 +1,242 @@
-// ============== Log corto ==============
-const LOG = [];
-const L = (...a) => { const s = `[${new Date().toISOString()}] ${a.map(x=>{try{return typeof x==='object'?JSON.stringify(x):String(x);}catch{return String(x);}}).join(' ')}`; console.log('[vidext]', ...a); LOG.push(s); if (LOG.length>400) LOG.shift(); };
+/***********************
+ * CONFIG & DEBUG
+ ***********************/
+const DEBUG = true;
+const DEBUG_DROPS = true;
+const TTL_MS = 0; 
 
-// ============== Estado por pestaña ==============
-const videosByTab = new Map();    // tabId -> entries[]
-const indexByTab = new Map();     // tabId -> Map(key -> idx)
-const injectedFrames = new Set(); // `${tabId}:${frameId}`
-const stateByTab = new Map();     // tabId -> Map(url -> state)
+// ⚠️ Si tu navegador corre en OTRO contenedor, cambia a la IP accesible (p.ej. 'http://172.17.0.1:8765/log')
+const DEVLOG_ENABLED = true;
+const DEVLOG_URL = 'http://127.0.0.1:8765/log';
 
-function setBadge(tabId, n){ try{chrome.action.setBadgeBackgroundColor({tabId,color:n?'#0b8457':'#777'}); chrome.action.setBadgeText({tabId,text:n?String(n):''});}catch{} }
-
-// ============== Clasificación y claves canónicas ==============
-function classify(url, ct) {
-  const u = String(url||'');
-  if (/\.(mp4|m4v|webm|mov|mkv|flv|avi)(\?|#|$)/i.test(u) || (ct && /^video\//i.test(ct))) return 'direct';
-  if (/\.(m3u8)(\?|#|$)/i.test(u) || (ct && /application\/(vnd\.apple\.mpegurl|x-mpegURL)/i.test(ct))) return 'hls';
-  if (/\.(mpd)(\?|#|$)/i.test(u) || (ct && /application\/dash\+xml/i.test(ct))) return 'dash';
-  if (/^https?:\/\/((www|m|music)\.)?youtube\.com\/(embed|watch|shorts)/i.test(u)) return 'embed-youtube';
-  if (/^https?:\/\/player\.vimeo\.com\/video\//i.test(u)) return 'embed-vimeo';
-  if (/^https?:\/\/www\.dailymotion\.com\/embed\/video\//i.test(u)) return 'embed-dailymotion';
-  if (/\.(m4s|ts|frag|cmfv|cmfa)(\?|#|$)/i.test(u)) return 'segment';
-  if (u.startsWith('blob:')) return 'mse-blob';
-  return 'unknown';
-}
-
-function ytId(s) {
+/***********************
+ * DEVLOG (envía a tu terminal)
+ ***********************/
+async function devlog(tag, msg, extra) {
+  if (!DEVLOG_ENABLED) return;
   try {
-    const u = new URL(s);
-    if (u.hostname.endsWith('youtube.com')) {
-      if (u.pathname.startsWith('/embed/')) return u.pathname.split('/')[2] || null;
-      if (u.pathname.startsWith('/shorts/')) return u.pathname.split('/')[2] || null;
-      if (u.pathname === '/watch') return u.searchParams.get('v');
-    }
-  } catch {}
-  return null;
-}
-function vimeoId(s) {
-  try {
-    const u = new URL(s);
-    if (u.hostname === 'player.vimeo.com' && u.pathname.startsWith('/video/')) {
-      const id = u.pathname.split('/')[2]; return id || null;
-    }
-  } catch {}
-  return null;
-}
-function dailymotionId(s) {
-  try {
-    const u = new URL(s);
-    if (u.hostname === 'www.dailymotion.com' && u.pathname.startsWith('/embed/video/')) {
-      return u.pathname.split('/')[3] || null;
-    }
-  } catch {}
-  return null;
-}
-
-function providerKeyFrom(entry) {
-  const url = String(entry.url||'');
-  const frame = String(entry.frameUrl||'');
-  const meta = entry.meta || {};
-
-  // Si ya viene con clave/ids
-  if (meta.provider && meta.providerId) return `${meta.provider}:${meta.providerId}`;
-
-  // YouTube
-  const y1 = ytId(url); if (y1) return `yt:${y1}`;
-  const y2 = ytId(frame); if (y2) return `yt:${y2}`;
-
-  // Vimeo
-  const v1 = vimeoId(url); if (v1) return `vimeo:${v1}`;
-  const v2 = vimeoId(frame); if (v2) return `vimeo:${v2}`;
-
-  // Dailymotion
-  const d1 = dailymotionId(url); if (d1) return `dm:${d1}`;
-  const d2 = dailymotionId(frame); if (d2) return `dm:${d2}`;
-
-  // blob dentro de un frame de proveedor => usa frame como clave
-  if (String(url).startsWith('blob:') && frame) return `frame:${new URL(frame).origin}`;
-
-  return null;
-}
-function canonicalKey(entry) {
-  return providerKeyFrom(entry) || String(entry.url||'');
-}
-
-// ============== Alta / fusión de entradas ==============
-function mergeState(tabId, entry) {
-  const st = stateByTab.get(tabId)?.get(entry.url);
-  return st ? { ...entry, state: st } : entry;
-}
-function upgradeEntry(base, incoming) {
-  // Prefiere meta/thumb/kind “mejor”
-  const bestUrl = (base.url.startsWith('blob:') && !incoming.url.startsWith('blob:')) ? incoming.url : base.url;
-  const meta = { ...(base.meta||{}), ...(incoming.meta||{}) };
-  const kind = base.kind === 'unknown' ? incoming.kind : base.kind;
-  const via  = base.via || incoming.via;
-  const frameUrl = base.frameUrl || incoming.frameUrl;
-  return { ...base, url: bestUrl, via, kind, meta, frameUrl, ts: base.ts || incoming.ts || Date.now() };
-}
-function pushVideo(tabId, rawEntry) {
-  if (tabId == null || tabId < 0) return;
-
-  const entry = mergeState(tabId, { ...rawEntry });
-  entry.kind = entry.kind || classify(entry.url, entry.meta?.ct);
-
-  const key = canonicalKey(entry);
-  let list = videosByTab.get(tabId) || [];
-  let idxMap = indexByTab.get(tabId) || new Map();
-
-  if (idxMap.has(key)) {
-    const idx = idxMap.get(key);
-    list[idx] = upgradeEntry(list[idx], entry);
-  } else {
-    list.push(entry);
-    idxMap.set(key, list.length - 1);
+    await fetch(DEVLOG_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tag, msg, extra })
+    });
+  } catch (e) {
+    // ¡CAMBIO IMPORTANTE!
+    // Si el logger falla, imprímelo en la consola del SW
+    // para que al menos sepamos POR QUÉ no hay logs.
+    console.error('DEVLOG_FAILED', e?.message || String(e), { tag, msg, extra });
   }
-  videosByTab.set(tabId, list);
-  indexByTab.set(tabId, idxMap);
-  setBadge(tabId, list.length);
 }
 
-// ============== Inyección MAIN world del hook ==============
-async function injectHook(tabId, frameId) {
-  const k = `${tabId}:${frameId}`;
-  if (injectedFrames.has(k)) return;
-  try {
-    await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, world: 'MAIN', files: ['page_hook.js'] });
-    injectedFrames.add(k);
-  } catch(e) { L('HOOK inject error', e.message); }
+/***********************
+ * LOG HELPERS
+ ***********************/
+const LOG = [];
+const MAX_LOGS = 1000;
+function safeStr(x){ try{ if(typeof x==='string') return x; return JSON.stringify(x,(k,v)=>(v instanceof Map?{__map:[...v]}:v)); }catch{ return String(x);} }
+function addLogLine(prefix,...args){
+  const line = `[BG ${new Date().toISOString()}] ${prefix} ${args.map(safeStr).join(' ')}`;
+  console.log(line);
+  LOG.push(line); if (LOG.length>MAX_LOGS) LOG.shift();
+  devlog('BG', line);
 }
-chrome.webNavigation.onCommitted.addListener(d => { injectedFrames.delete(`${d.tabId}:${d.frameId}`); injectHook(d.tabId, d.frameId); });
-chrome.webNavigation.onDOMContentLoaded.addListener(d => injectHook(d.tabId, d.frameId));
-chrome.tabs.onRemoved.addListener(id => { videosByTab.delete(id); indexByTab.delete(id); stateByTab.delete(id); [...injectedFrames].forEach(k=>{ if(k.startsWith(`${id}:`)) injectedFrames.delete(k); }); });
+function log(...a){ if (DEBUG) addLogLine('', ...a); }
+function logDrop(reason,item,ctx={}){ if(!DEBUG||!DEBUG_DROPS) return; const payload={reason,url:item?.url,frameUrl:item?.frameUrl,ctx}; addLogLine('[DROP]', safeStr(payload)); devlog('DROP', reason, payload); }
 
-// ============== Sniffer red (pasivo) ==============
-function readCT(headers=[]){ const m=Object.create(null); headers.forEach(h=>m[String(h.name).toLowerCase()]=h.value||''); return m['content-type']||''; }
-chrome.webRequest.onBeforeRequest.addListener(
-  (d) => { if (d.tabId<0) return; const u=d.url||''; if (/\.(mp4|m4v|webm|mov|m3u8|mpd)(\?|#|$)/i.test(u)) pushVideo(d.tabId,{url:u,via:'onBeforeRequest',frameUrl:d.initiator||'(net)'}); },
-  { urls: ["<all_urls>"] }, ["extraHeaders"]
-);
-chrome.webRequest.onResponseStarted.addListener(
-  (d) => { if (d.tabId<0) return; const u=d.url||''; const ct=readCT(d.responseHeaders||[]); if (/\.(mp4|m4v|webm|mov|m3u8|mpd)(\?|#|$)/i.test(u) || /^video\//i.test(ct) || /application\/(vnd\.apple\.mpegurl|x-mpegURL|dash\+xml)/i.test(ct)) pushVideo(d.tabId,{url:u,via:'onResponseStarted',frameUrl:d.initiator||'(net)',meta:{ct}}); },
-  { urls: ["<all_urls>"] }, ["responseHeaders","extraHeaders"]
-);
+/***********************
+ * STATE (por pestaña/documento)
+ ***********************/
+const byTab=new Map();              // tabId -> { currentDoc, docs: Map(docKey -> {list, index, startTs}) }
+const injectedFrame=new Set();      // `${tabId}:${frameId}`
+const pageThumbByTab=new Map();     // tabId -> dataURL
 
-// ============== Estado playing/paused + miniaturas ==============
-function updateVideoState(tabId, st, metaExtra) {
-  if (!st || !st.url) return;
-  const map = stateByTab.get(tabId) || new Map();
-  map.set(st.url, st);
-  stateByTab.set(tabId, map);
+function normalizeDoc(url){ try{ const u=new URL(String(url)); return `${u.origin}${u.pathname}${u.search}`; }catch{ return ''; } }
+function originOfUrl(s){ try{ return new URL(String(s)).origin; }catch{ const str=String(s||''); if(str.startsWith('blob:')||str.startsWith('data:')) return 'blob-data://'; return ''; } }
+function originRaw(s){ try{ return new URL(String(s)).origin; }catch{ return ''; } }
 
-  const entry = { url: st.url, frameUrl: st.frameUrl, via:'state', meta: {}, kind: classify(st.url) };
-  // si llega thumb/provider desde content, añádelo
-  if (metaExtra && typeof metaExtra === 'object') entry.meta = { ...entry.meta, ...metaExtra };
-  pushVideo(tabId, entry);
-}
+function tabState(tabId){ if(!byTab.has(tabId)){ byTab.set(tabId,{currentDoc:'',docs:new Map()}); devlog('STATE','tabState:init',{tabId}); } return byTab.get(tabId); }
+function docBucket(tabId,docKey){ const st=tabState(tabId); if(!st.docs.has(docKey)){ st.docs.set(docKey,{list:[],index:new Map(),startTs:Date.now()}); devlog('STATE','docBucket:init',{tabId,docKey}); } return st.docs.get(docKey); }
+function setCurrentDoc(tabId,url){ const st=tabState(tabId); const key=normalizeDoc(url); if(!key) return; if(st.currentDoc!==key){ st.currentDoc=key; const b=docBucket(tabId,key); b.startTs=Date.now(); setBadge(tabId,0); devlog('NAV','setCurrentDoc',{tabId,key,startTs:b.startTs}); } }
+function currentDocKey(tabId){ const st=tabState(tabId); return st.currentDoc||''; }
+function setBadge(tabId,n){ if(!tabId) return; try{ chrome.action.setBadgeText({tabId,text:n?String(n):''}); }catch{} }
+function dumpStateObj(tabId=null){ const obj={}; for(const [tId,st] of byTab.entries()){ if(tabId!==null && tId!==tabId) continue; obj[tId]={currentDoc:st.currentDoc,docs:[...st.docs.entries()].map(([k,v])=>({key:k,startTs:v.startTs,count:v.list.length,urls:v.list.slice(0,50).map(e=>e.url)}))}; } return obj; }
 
-// ============== Helpers descarga/API ==============
-function suggestName(u){ try{ const url=new URL(u); const base=(url.pathname.split('/').pop()||'video').split('?')[0]; return base||'video.mp4'; }catch{ return 'video.mp4'; } }
-function inferReferer(resourceUrl,pageUrl){ try{ new URL(resourceUrl); new URL(pageUrl); return pageUrl; }catch{ return pageUrl; } }
-async function getUA(tabId,frameId=0){ try{ const [r]=await chrome.scripting.executeScript({target:{tabId,frameIds:[frameId]},world:'MAIN',func:()=>navigator.userAgent}); return String(r.result||''); }catch{ return ''; } }
-async function buildCookieHeader(u){ try{ const cookies=await chrome.cookies.getAll({url:u}); if(!cookies?.length) return null; return cookies.map(c=>`${c.name}=${c.value}`).join('; ');}catch{ return null; } }
-async function getApiUrl(){ const s=await chrome.storage.local.get('apiUrl'); return s.apiUrl || 'http://localhost:3001/ingest'; }
-async function postToApi(payload, apiUrl){ const endpoint=apiUrl || (await getApiUrl()); try{ const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); return {ok:res.ok,status:res.status}; }catch(e){ return {ok:false,error:e.message}; } }
-
-async function sendToApiDownload({ tabId, url }) {
-  const tab = await chrome.tabs.get(tabId);
-  const pageUrl = tab.url;
-  const referer = inferReferer(url, pageUrl);
-  const ua = await getUA(tabId).catch(()=> '');
-  const cookies = await buildCookieHeader(url);
-  const apiUrl = await getApiUrl();
-  const kind = classify(url);
-
-  const payload = { url, kind, referer, userAgent: ua, pageUrl, cookies, filename: suggestName(url), ts: Date.now() };
-  const r = await postToApi(payload, apiUrl);
-  return r.ok ? { ok:true, mode:'api', status:r.status } : { ok:false, error:r.error || `status=${r.status}` };
+/***********************
+ * INJECTION
+ ***********************/
+async function injectHook(tabId,frameId=0){
+  const k=`${tabId}:${frameId}`; if(injectedFrame.has(k)) return;
+  try{
+    await chrome.scripting.executeScript({ target:{tabId,frameIds:[frameId]}, world:'MAIN', files:['page_hook.js'] });
+    injectedFrame.add(k); devlog('INJECT','ok',{tabId,frameId});
+  }catch(e){ devlog('INJECT','error',{tabId,frameId,err:e?.message||String(e)}); }
 }
 
-// ============== Mensajería ==============
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  try {
-    if (msg?.type === 'ensureHook') {
-      const tabId = sender?.tab?.id ?? msg.tabId ?? -1;
-      const frameId = sender?.frameId ?? 0;
-      injectHook(tabId, frameId).then(()=>sendResponse({ok:true})).catch(e=>sendResponse({ok:false,error:e.message}));
+/***********************
+ * ADD / UPDATE ITEMS
+ ***********************/
+function pushVideoToDoc(tabId,docKey,entry){
+  const bucket=docBucket(tabId,docKey); const key=`${entry.url}@@${entry.frameUrl||''}`;
+  if(bucket.index.has(key)){ 
+    const i=bucket.index.get(key); const prev=bucket.list[i]; 
+    // Merge: combinar meta nuevo (ej: thumb) con el viejo
+    const meta = { ...(prev.meta || {}), ...(entry.meta || {}) };
+    bucket.list[i]={...prev,...entry, meta, ts:prev.ts||Date.now()}; 
+    devlog('VIDEO','update',{tabId,docKey,key,url:entry.url}); 
+  }
+  else { 
+    bucket.list.push({...entry,ts:Date.now()}); 
+    bucket.index.set(key,bucket.list.length-1); 
+    devlog('VIDEO','new',{tabId,docKey,key,url:entry.url,frameUrl:entry.frameUrl}); 
+  }
+  if(currentDocKey(tabId)===docKey) setBadge(tabId,bucket.list.length);
+}
+function removeTab(tabId){ byTab.delete(tabId); pageThumbByTab.delete(tabId); for(const k of [...injectedFrame]) if(k.startsWith(`${tabId}:`)) injectedFrame.delete(k); devlog('STATE','removeTab',{tabId}); }
+
+/***********************
+ * RUNTIME MESSAGES
+ ***********************/
+chrome.runtime.onMessage.addListener((msg,sender,sendResponse)=>{
+  try{
+    // No loguear 'videoState' para no inundar el log
+    if(msg?.type !== 'videoState') {
+      devlog('MSG','onMessage',{type:msg?.type,fromTab:sender?.tab?.id,frameId:sender?.frameId});
+    }
+
+    // 🔔 PING desde popup: asegura que ves algo en la terminal al abrir
+    if(msg?.type==='dbg.ping'){ devlog('DBG','PING',{from:msg.from||'unknown'}); sendResponse?.({ok:true}); return true; }
+
+    if(msg?.type==='ensureHook'){ const tabId=sender?.tab?.id ?? msg.tabId ?? -1; const frameId=sender?.frameId ?? 0; injectHook(tabId,frameId).then(()=>sendResponse({ok:true})).catch(e=>sendResponse({ok:false,error:e?.message||String(e)})); return true; }
+
+    if(msg?.type==='videoFound'){ const tabId=sender?.tab?.id ?? msg.tabId ?? -1; const frameUrl=msg.frameUrl || sender?.url || ''; const docKey=normalizeDoc(frameUrl) || currentDocKey(tabId);
+      pushVideoToDoc(tabId,docKey,{ url:msg.url, via:msg.via||'content', frameId:sender?.frameId ?? 0, frameUrl, meta:msg.meta||null }); return; }
+
+    if(msg?.type==='videoState'){ const tabId=sender?.tab?.id ?? msg.tabId ?? -1; const frameUrl=msg.frameUrl || sender?.url || ''; const docKey=normalizeDoc(frameUrl) || currentDocKey(tabId);
+      try{ const b=docBucket(tabId,docKey); for(let i=0;i<b.list.length;i++){ if(b.list[i].url===msg.url){ b.list[i]={...b.list[i], meta:{...(b.list[i].meta||{}), ...(msg.meta||{})} }; } } }catch{} return; }
+
+    if(msg?.type==='pageThumb'){ const tabId=sender?.tab?.id ?? msg.tabId ?? -1; if(msg.thumb) pageThumbByTab.set(tabId,String(msg.thumb)); return; }
+
+    
+    // ### INICIO DE LA MODIFICACIÓN ###
+    // Manejador para la lista de vídeos YA FILTRADA desde el content script
+    if(msg?.type==='dbg.foundMediaElements'){
+      devlog('DOM_VIDEOS', 
+        `Recibidos ${msg.count || 0} elementos <video/iframe/obj/embed> desde ${msg.frameUrl || '?'}`, 
+        { 
+          count: msg.count,
+          elements: msg.elements, // La lista ya viene filtrada
+          frameUrl: msg.frameUrl || '?'
+        }
+      );
+      sendResponse({ok:true});
       return true;
     }
-    if (msg?.type === 'videoFound') {
-      const tabId = sender?.tab?.id ?? msg.tabId ?? -1;
-      pushVideo(tabId, { url: msg.url, via: msg.via || 'content', frameUrl: msg.frameUrl || '(frame)', meta: msg.meta || null });
-      return;
-    }
-    if (msg?.type === 'videoState') {
-      const tabId = sender?.tab?.id ?? msg.tabId ?? -1;
-      updateVideoState(tabId, msg.state, msg.meta || null);
-      return;
-    }
-    if (msg?.type === 'getVideos') {
-      const list = (videosByTab.get(msg.tabId) || []);
-      sendResponse({ list });
+    
+    // Manejador opcional para errores del content script
+    if(msg?.type==='dbg.contentScriptError'){
+      devlog('ERR', `Error en content script ${msg.frameUrl || '?'}`, { error: msg.error });
       return true;
     }
+    
+    // El manejador 'dbg.logDOM' original ha sido eliminado
+    // ### FIN DE LA MODIFICACIÓN ###
+
+
+    if(msg?.type==='getVideos'){
+      (async ()=>{
+        let tab, currentUrl=''; try{ tab=await chrome.tabs.get(msg.tabId); currentUrl=tab?.url||''; }catch{}
+        if(!currentUrl) currentUrl=currentDocKey(msg.tabId);
+        setCurrentDoc(msg.tabId,currentUrl);
+
+        const docKey=normalizeDoc(currentUrl);
+        const bucket=docBucket(msg.tabId,docKey);
+        const curOrigin=originOfUrl(currentUrl);
+        const pageThumb=pageThumbByTab.get(msg.tabId)||null;
+
+        devlog('GET','context',{ tabId:msg.tabId, currentUrl, docKey, curOrigin, bucketCount:bucket.list.length, startTs:bucket.startTs, TTL_MS });
+
+        const explain=[]; const kept=[];
+        for(const e of bucket.list){
+          const videoOrigin=originOfUrl(e.url);
+          const frameOrigin=originRaw(e.frameUrl||'');
+          // ¡CAMBIO IMPORTANTE! Permitir cualquier origen http/https
+          const originOK = (videoOrigin==='blob-data://') || videoOrigin.startsWith('http'); 
+          const withinTTL=!TTL_MS || (e.ts>=bucket.startTs && (Date.now()-e.ts)<=TTL_MS);
+
+          const reasons=[];
+          if(videoOrigin==='blob-data://') reasons.push('origen=blob/data (propio del doc)');
+          else reasons.push(`origenVideo=${videoOrigin} vs origenPagina=${curOrigin}`);
+          reasons.push(withinTTL ? 'TTL=OK' : 'TTL=EXPIRED');
+          if(frameOrigin) reasons.push(`origenFrame=${frameOrigin}`);
+          if(!originOK) reasons.push('ORIGEN RECHAZADO');
+
+          const keep = originOK && withinTTL;
+          explain.push({ keep, url:e.url, frameUrl:e.frameUrl||null, via:e.via||null, ts:e.ts, originVideo:videoOrigin, originFrame:frameOrigin||null, originPage:curOrigin, reasons });
+          if(keep){ const meta={...(e.meta||{})}; if(!meta.thumb && pageThumb) meta.thumb=pageThumb; kept.push({...e, meta}); }
+          else { logDrop('kept=false', e, { reasons }); }
+        }
+
+        devlog('GET','result',{ tabId:msg.tabId, kept:kept.length, sample:explain.slice(0,5) });
+        sendResponse({ list: kept, explain });
+      })();
+      return true;
+    }
+
+    // MENSAJE PARA DESCARGAR (desde popup.js)
     if (msg?.type === 'downloadViaApi') {
-      sendToApiDownload(msg).then(sendResponse).catch(e=>sendResponse({ok:false,error:e.message}));
+      (async () => {
+        const url = msg.url;
+        const tabId = msg.tabId;
+        devlog('DOWNLOAD', 'Recibida petición de descarga', { url, tabId });
+        try {
+          // Asumimos que tu API espera un JSON con la URL
+          const apiRes = await fetch('http://127.0.0.1:8765/download', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: url, tabId: tabId })
+          });
+          if (!apiRes.ok) throw new Error(`El servidor API respondió con ${apiRes.status}`);
+          const resJson = await apiRes.json();
+          devlog('DOWNLOAD', 'Respuesta OK de la API', { url, res: resJson });
+          sendResponse({ ok: true, response: resJson });
+        } catch (e) {
+          devlog('DOWNLOAD', 'ERROR al contactar con API', { url, err: e?.message || String(e) });
+          sendResponse({ ok: false, error: e?.message || String(e) });
+        }
+      })();
       return true;
     }
-    if (msg?.type === 'clearVideos') {
-      videosByTab.delete(msg.tabId); indexByTab.delete(msg.tabId); setBadge(msg.tabId,0);
-      sendResponse({ ok:true }); return true;
-    }
-  } catch(e){ L('ERR onMessage', e.message); }
+
+    // Panel debug opcional
+    if(msg?.type==='dbg.logs'){ const lim=Math.max(1,Math.min(2000,Number(msg.limit)||500)); sendResponse({ok:true,logs:LOG.slice(-lim)}); return true; }
+    if(msg?.type==='dbg.dump'){ sendResponse({ok:true,state:dumpStateObj(msg.tabId ?? null)}); return true; }
+    if(msg?.type==='dbg.clearAll'){ byTab.clear(); pageThumbByTab.clear(); sendResponse({ok:true}); devlog('STATE','clearAll'); return true; }
+
+  }catch(e){ devlog('ERR','onMessage:exception',{info:e?.message||String(e)}); }
 });
 
-chrome.tabs.onActivated.addListener(({tabId}) => setBadge(tabId, (videosByTab.get(tabId)||[]).length));
+/***********************
+ * NAVIGATION EVENTS
+ ***********************/
+function onMainDocChange(tabId,url,source){ setCurrentDoc(tabId,url); setBadge(tabId,0); injectHook(tabId,0); devlog('NAV','main-change',{tabId,url,source}); }
+chrome.webNavigation.onCommitted.addListener(d=>{ try{ if(d.frameId===0) onMainDocChange(d.tabId,d.url||'','onCommitted'); }catch{} });
+chrome.webNavigation.onHistoryStateUpdated.addListener(d=>{ try{ if(d.frameId===0) onMainDocChange(d.tabId,d.url||'','onHistoryStateUpdated'); }catch{} });
+chrome.tabs.onUpdated.addListener((tabId,changeInfo,tab)=>{ try{ if(tab?.active && (changeInfo.url || changeInfo.status==='loading' || changeInfo.status==='complete')) onMainDocChange(tabId,tab.url||'','tabs.onUpdated'); }catch{} });
+chrome.tabs.onActivated.addListener(async ({tabId})=>{ try{ const t=await chrome.tabs.get(tabId); onMainDocChange(tabId,t?.url||'','tabs.onActivated'); const key=currentDocKey(tabId); const b=docBucket(tabId,key); setBadge(tabId,b.list.length); }catch{} });
+chrome.tabs.onRemoved.addListener(tabId=>removeTab(tabId));
+
+/***********************
+ * LIFECYCLE + BOOT PINGS
+ ***********************/
+(async ()=>{
+  // BOOT inmediato: esto debe verse en tu terminal tras recargar la extensión
+  devlog('BOOT', 'service-worker loaded', { version: chrome.runtime.getManifest?.().version });
+})();
+chrome.runtime.onInstalled.addListener(info => devlog('LIFE','onInstalled', info));
+chrome.runtime.onStartup.addListener(()=> devlog('LIFE','onStartup',{}));
+
+/***********************
+ * GLOBAL ERROR HOOKS
+ ***********************/
+self.addEventListener('unhandledrejection', ev => { devlog('ERR','unhandledrejection',{reason:safeStr(ev.reason)}); });
+self.addEventListener('error', ev => { devlog('ERR','error',{message:safeStr(ev.message || ev.error || ev)}); });
