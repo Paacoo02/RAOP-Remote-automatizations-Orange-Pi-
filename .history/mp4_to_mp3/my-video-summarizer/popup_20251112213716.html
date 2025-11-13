@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Vídeos</title>
+  <style>
+    /* Forzar fondo claro */
+    body { 
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; 
+      margin: 12px; 
+      width: 420px; 
+      color: #111; 
+      background: #fff; /* Fondo blanco siempre */
+    }
+    @media (max-width: 460px) { body { width: 100vw; } }
+    h1 { font-size: 16px; margin: 0 0 10px; }
+    #actions { display:flex; gap:8px; margin-bottom:10px; }
+    button { padding:6px 10px; border-radius:8px; border:1px solid #ddd; cursor:pointer; background:#f9f9f9; }
+    button:hover { background: #eee; }
+    button:active { background: #e5e5e5; }
+    button.primary { background:#0b8457; color:#fff; border-color:#0b8457; }
+    button.primary:hover { background: #0a734c; }
+    ul { list-style:none; padding:0; margin:0; display:flex; flex-direction:column; gap:10px; }
+    li { display:flex; gap:10px; border:1px solid #eee; border-radius:12px; padding:10px; }
+    .thumb { width:120px; height:68px; background:#f4f4f4; border-radius:8px; overflow:hidden; display:flex; align-items:center; justify-content:center; font-size:12px; color:#666; flex-shrink:0; }
+    .thumb video, .thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+    .meta { flex:1; min-width:0; }
+    .title { font-weight:600; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .sub { color:#555; font-size:12px; margin-top:2px; }
+    .pills { margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
+    .pill { font-size:11px; padding:2px 6px; border-radius:999px; background:#f0f0f0; color:#333; }
+    .row { margin-top:8px; display:flex; gap:8px; align-items:center; }
+
+    /* Estilos del Panel Debug */
+    details { margin-top: 15px; border-top: 1px solid #eee; padding-top: 15px; }
+    summary { font-weight: 600; cursor: pointer; }
+    #dbgPanel { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+    #dbgPanel .row { display: flex; gap: 8px; }
+    #dbgPanel textarea { width: 100%; height: 150px; font-family: monospace; font-size: 10px; }
+    #dbgPanel label { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Vídeos detectados</h1>
+  <div id="actions">
+    <button id="refresh" class="primary">Actualizar</button>
+  </div>
+  <ul id="list"><li>Cargando…</li></ul>
+  
+  <div id="ctx" style="font-size:10px; color:#888; margin-top:8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></div>
+
+  <!-- Panel de Debug que faltaba -->
+  <details>
+    <summary>Debug Panel</summary>
+    <div id="dbgPanel">
+      <div class="row">
+        <button id="dbgRefresh">Refrescar Logs</button>
+        <button id="dbgDump">Volcar Estado</button>
+        <button id="dbgClear">Limpiar Todo</button>
+        <button id="dbgDumpDOM">Volcar DOM</button> <!-- Botón nuevo -->
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="dbgAuto" /> Auto-refresco</label>
+      </div>
+      <textarea id="dbgLog" readonly></textarea>
+    </div>
+  </details>
+
+  <script src="popup.js"></script>
+</body>
+</html>

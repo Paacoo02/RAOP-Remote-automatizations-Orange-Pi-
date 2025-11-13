@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Video Catch & Send",
+  "version": "3.1.0",
+  "description": "Detecta vídeos (directos, HLS/DASH, embeds), deduplica y envía el enlace a tu API para descargar.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs",
+    "webRequest",
+    "webNavigation",
+    "cookies"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "Vídeos detectados",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["page_hook.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
