@@ -251,44 +251,30 @@ function markChatIncomplete(incompleteMap, chat, reason) {
 // -------------------------------------------------------------
 //  SCRAPER: TU CÓDIGO EXACTO + SENSOR DE MURO CON RETARDO (3s)
 // -------------------------------------------------------------
-// -------------------------------------------------------------
-//  SCRAPER TURBO: CSS HACK + SENSOR DE MURO
-// -------------------------------------------------------------
 async function exportCurrentChatFromPage(page) {
+  // Timeout 0 para evitar cortes en chats largos
   return await page.evaluate(async () => {
-    // ⚡ HACK DE RENDIMIENTO: Ocultar media y anular animaciones
-    // Esto reduce drásticamente el uso de CPU/GPU al hacer scroll
-    const styleId = 'wa-turbo-mode-style';
-    if (!document.getElementById(styleId)) {
-        const style = document.createElement('style');
-        style.id = styleId;
-        style.innerHTML = `
-            * { transition: none !important; animation: none !important; }
-            img, video, canvas { display: none !important; } 
-            div[role="button"] img { display: none !important; }
-            /* Mantener solo texto visible */
-        `;
-        document.head.appendChild(style);
-        console.log("[Browser] ⚡ Turbo Mode CSS inyectado (Imágenes ocultas).");
-    }
+    console.log("[Browser] Iniciando script de usuario (con Sensor de Muro Retardado)...");
 
+    // --- TU CÓDIGO ORIGINAL ---
     if (window.__waCounterAuto) { try { window.__waCounterAuto.stop(); } catch(e){} }
 
     const seen = new Set();
     const messagesMap = new Map();
     let scroller = null, running = true;
+    
+    // Variables para control de sincronización
     let syncWallHit = false;
     let jumpAnchor = null;
 
-    // Reducimos tiempo de espera entre scrolls (de 600 a 400ms)
-    // Al no haber imágenes, carga más rápido.
-    const SCROLL_DELAY = 400; 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     
-    const getCopyables = () => document.querySelectorAll("div.copyable-text,[data-pre-plain-text], div.message-in, div.message-out");
+    // Selector original
+    const getCopyables = () => document.querySelectorAll("div.copyable-text,[data-pre-plain-text]");
 
+    // TEXTOS DE BLOQUEO
     const WALL_TEXTS = [
-      "Haz clic aquí para obtener mensajes anteriores",
+      "Haz clic aquí para obtener mensajes anteriores de tu teléfono",
       "No se pudieron obtener mensajes anteriores",
       "Abre WhatsApp en tu teléfono",
       "Se están sincronizando mensajes más antiguos",
@@ -297,46 +283,42 @@ async function exportCurrentChatFromPage(page) {
 
     function parseInfo(node){
       const pre = node.getAttribute?.("data-pre-plain-text") || "";
-      // Selectores optimizados
-      const textEl = node.querySelector("span.selectable-text") || node.querySelector("div.selectable-text");
-      const text = textEl ? textEl.innerText : (node.innerText || "");
-      
+      const textEl = node.querySelector?.("span.selectable-text") || node.querySelector?.("div.selectable-text");
+      const text = textEl ? textEl.innerText : "";
       if (!pre && !text) return null;
-      
-      const uid = pre + "|" + text.substring(0, 40);
+      const uid = pre + "|" + text;
       let ts = "", author = "";
       const m = pre.match(/\[(.*?)\]\s*(.*?):\s?$/);
       if (m){ ts = m[1]; author = m[2]; }
-      return { uid, ts, author, text: text.replace(/\r?\n/g, " "), pre };
+      return { uid, ts, author, text, pre };
     }
 
     function scan(){
       let added = 0;
-      const nodes = getCopyables();
-      // Bucle for clásico es ligeramente más rápido que forEach en V8 antiguo, pero aquí da igual
-      for (const node of nodes) {
+      getCopyables().forEach(node=>{
         const info = parseInfo(node);
-        if (!info) continue;
+        if (!info) return;
         if (!seen.has(info.uid)){
           seen.add(info.uid);
           messagesMap.set(info.uid, info);
           added++;
         }
-      }
+      });
       return added;
     }
 
+    // Detectar si el muro está visible
     function checkForSyncWall() {
        const main = document.querySelector("#main");
        if (!main) return false;
-       // Usamos textContent que es más barato que innerText (no calcula estilos)
-       const txt = main.textContent; 
+       const html = main.innerText; 
        for (const w of WALL_TEXTS) {
-           if (txt.includes(w)) return true;
+           if (html.includes(w)) return true;
        }
        return false;
     }
 
+    // Obtener el texto del mensaje más viejo visualmente
     function getOldestVisibleText() {
         const nodes = getCopyables();
         if (nodes.length > 0) {
@@ -347,79 +329,118 @@ async function exportCurrentChatFromPage(page) {
     }
 
     function getChatTitle(){
-        // Lógica simplificada de título
-        const h = document.querySelector("#main header span[title]");
-        return h ? (h.getAttribute("title") || h.innerText) : "chat";
+      const header = document.querySelector("#main header");
+      if (header){
+        const selectors = [
+          'span.x1iyjqo2.x6ikm8r.x10wlt62.x1n2onr6.xlyipyv.xuxw1ft.x1rg5ohu._ao3e',
+          '[data-testid="conversation-info-header-chat-title"]',
+          'span[title]',
+          '[title]'
+        ];
+        for (const sel of selectors){
+          const el = header.querySelector(sel);
+          if (el){
+            const t = (el.getAttribute("title") || el.textContent || "").trim();
+            if (t) return t;
+          }
+        }
+      }
+      const altHeader = document.querySelector('[data-testid="conversation-header"]');
+      if (altHeader){
+        const el = altHeader.querySelector('[data-testid="conversation-info-header-chat-title"], span[title], [title]');
+        if (el){ const t = (el.getAttribute("title") || el.textContent || "").trim(); if (t) return t; }
+      }
+      return "whatsapp_chat";
     }
 
     function findScrollContainer(){
-      // Buscamos el panel de mensajes directamente
-      // El ID "main" suele contener un div con tabindex="-1" que es el scroller
-      const main = document.getElementById('main');
-      if (!main) return null;
-      
-      // Estrategia rápida: buscar el div más grande con overflow
-      const divs = main.querySelectorAll('div[tabindex="-1"]');
-      for (const d of divs) {
-          if (d.scrollHeight > d.clientHeight) return d;
+      const candidates = [
+        '[data-testid="conversation-panel-body"]',
+        '[data-testid="conversation-panel-messages"]',
+        '#main [tabindex="-1"]',
+        '#main'
+      ].map(sel => document.querySelector(sel)).filter(Boolean);
+
+      const anyMsg = getCopyables()[0];
+      if (anyMsg){
+        let p = anyMsg.parentElement;
+        while (p){
+          const st = getComputedStyle(p);
+          if ((st.overflowY === 'auto' || st.overflowY === 'scroll') && p.scrollHeight > p.clientHeight + 20) {
+            candidates.push(p);
+          }
+          p = p.parentElement;
+        }
       }
-      return null;
+      const uniq = Array.from(new Set(candidates));
+      uniq.sort((a,b)=> (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+      return uniq.find(el => el && el.scrollHeight > el.clientHeight + 20) || null;
     }
 
     async function run(){
       scroller = findScrollContainer();
-      if (!scroller){ scan(); return; }
+      if (!scroller){
+        console.warn("⚠️ No se encontró contenedor de scroll.");
+        scan();
+        return;
+      }
 
-      // MutationObserver es caro en CPU si hay muchos cambios.
-      // En modo Turbo, confiamos más en el intervalo y el scroll.
-      // const obs = new MutationObserver(()=> scan()); ... (Desactivado para ahorrar CPU)
+      const target = document.querySelector("#main") || document.body;
+      const obs = new MutationObserver(()=> scan());
+      obs.observe(target, {subtree:true, childList:true});
 
       scan();
-      
-      // Polling más rápido
-      const timer = setInterval(scan, 500);
+      const timer = setInterval(scan, 600);
 
-      let stagnation = 0, rounds = 0, maxStagnation = 8; // Bajamos estancamiento a 8
+      let stagnation = 0, rounds = 0, maxStagnation = 10;
       
       while (running) {
+        // 🔴 LÓGICA ACTUALIZADA: VERIFICACIÓN DOBLE DEL MURO
         if (checkForSyncWall()) {
-            // Check rápido
-            console.log("[Browser] 🧱 Muro detectado. Confirmando...");
-            await sleep(2500);
+            console.log("[Browser] 🧱 Posible muro detectado. Esperando 3s para confirmar...");
+            
+            // Esperamos 3 segundos para ver si desaparece (lazy loading)
+            await sleep(3000);
+
+            // Volvemos a comprobar
             if (checkForSyncWall()) {
+                console.log("[Browser] 🧱 Muro CONFIRMADO tras espera. Deteniendo scroll.");
                 syncWallHit = true;
-                jumpAnchor = getOldestVisibleText();
+                jumpAnchor = getOldestVisibleText(); // Guardamos la "llave"
                 break; 
+            } else {
+                console.log("[Browser] 🔄 Falsa alarma: El muro desapareció (carga en progreso). Seguimos.");
             }
         }
 
         rounds++;
         const before = seen.size;
-        
-        // Scroll agresivo
-        try { scroller.scrollTop = 0; } catch(e){}
-        
-        await sleep(SCROLL_DELAY);
+        try { scroller.scrollTop = 0; scroller.dispatchEvent(new Event('scroll')); } catch(e){}
+        await sleep(600);
         const added = scan();
         const after = seen.size;
         
         stagnation = (added === 0 && after === before) ? (stagnation+1) : 0;
+        
         if (stagnation >= maxStagnation) break;
       }
 
+      try { obs.disconnect(); } catch(e){}
       try { clearInterval(timer); } catch(e){}
       running = false;
     }
-
+    
     await run();
 
-    // Retorno optimizado
+    // RETORNO
     const lines = [];
     for (const info of messagesMap.values()){
-       // Concatenación directa es rápida
-       lines.push(`[${info.ts||""}] ${info.author||"Yo"}: ${info.text}`);
+      const author = info.author || "Yo";
+      const ts = info.ts || "";
+      const text = (info.text || "").replace(/\r?\n/g, " ");
+      lines.push(`[${ts}] ${author}: ${text}`);
     }
-
+    
     return {
         title: getChatTitle(),
         count: messagesMap.size,
@@ -838,38 +859,48 @@ function normalizeChatTitleForSearch(chatTitle) {
 // -------------------------------------------------------------
 //  FUNCIÓN DE APERTURA: TECLADO PURO (Flecha Abajo + Enter)
 // -------------------------------------------------------------
-// -------------------------------------------------------------
-//  APERTURA RÁPIDA (TIEMPOS AJUSTADOS)
-// -------------------------------------------------------------
 async function openChatByTitle(page, chatTitle) {
   const searchBox = await getChatSearchBox(page);
   if (!searchBox) throw new Error("Buscador no encontrado.");
 
+  // Normalización
   const cleanTitle = chatTitle.normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
     .replace(/[^\p{Letter}\p{Number}\s]/gu, "").replace(/\s+/g, " ").trim().toLowerCase();
 
   console.log(`[FASE 2] Buscando: "${cleanTitle}"`);
 
+  // 1. Escribir Búsqueda
   await searchBox.click();
-  
-  // Limpieza rápida (Triple clic selecciona todo el texto habitualmente)
-  await searchBox.click({ clickCount: 3 });
+  await page.keyboard.press("Control+A");
   await page.keyboard.press("Backspace");
-  
-  // Escritura rápida (30ms delay es suficiente para WA)
-  await page.keyboard.type(cleanTitle, { delay: 30 });
-  
-  // Espera reducida (1.2s suele bastar para que filtre localmente)
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(300);
+  await page.keyboard.type(cleanTitle, { delay: 70 });
+  await page.waitForTimeout(2000); // Espera vital para resultados
 
-  // Selección Teclado
-  await page.keyboard.press("ArrowDown");
-  await page.waitForTimeout(100); // Mínima espera
-  await page.keyboard.press("Enter");
+  // 2. ESTRATEGIA HÍBRIDA: Locator + Tab
+  console.log(`[FASE 2] Intentando localizar fila que contenga "${cleanTitle}"...`);
 
-  // Limpieza UI
-  await page.waitForTimeout(800);
-  await page.keyboard.press("Escape"); 
+  // Buscamos una fila en el panel lateral que contenga el texto (case-insensitive aproximado)
+  // El regex 'i' hace que no importen mayúsculas/minúsculas
+  const rowLocator = page.locator('#pane-side [role="row"]')
+    .filter({ hasText: new RegExp(cleanTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') })
+    .first();
+
+  if (await rowLocator.count() > 0) {
+      console.log("[FASE 2] ✅ Fila encontrada. Haciendo clic nativo...");
+      // force: true salta validaciones de si el elemento está tapado por un tooltip
+      await rowLocator.click({ force: true, timeout: 3000 });
+  } else {
+      console.warn("[FASE 2] ⚠️ No se encontró la fila por texto exacto. Usando PLAN B (Tab + Enter).");
+      // Si el texto no coincide (ej. por tildes raras), usamos navegación de teclado
+      await page.keyboard.press('Tab'); // Mover foco fuera del input
+      await page.waitForTimeout(200);
+      await page.keyboard.press('Enter');
+  }
+
+  // 3. LIMPIEZA
+  // A veces la búsqueda se queda abierta. Si vemos el botón "X" de cancelar búsqueda, lo pulsamos 
+  // PERO solo si ya detectamos que el chat parece estar cargando, para no cerrarlo antes de tiempo.
   await page.waitForTimeout(1000);
 }
 
@@ -1033,53 +1064,20 @@ async function processSingleChatOnPage(page, chat, db, retryList, incompleteMap,
 //  FASE 2: EXTRACCIÓN SECUENCIAL
 // -------------------------------------------------------------
 
-// -------------------------------------------------------------
-//  FASE 2: EXTRACCIÓN TURBO (CON GESTIÓN DE MEMORIA)
-// -------------------------------------------------------------
-async function phase2_extractChats_Sequential(initialPage, chatList, incompleteMap) {
-  console.log(`\n[${nowTs()}] [FASE 2] 🚀 Iniciando TURBO MODE secuencial...`);
+async function phase2_extractChats_Sequential(page, chatList, incompleteMap) {
+  console.log(
+    `\n[${nowTs()}] [FASE 2] Iniciando extracción SECUENCIAL de ${chatList.length} chats (una sola pestaña)...`
+  );
 
   const db = await dbPromise;
   const retryList = [];
   const totalChats = chatList.length;
-  
-  // CONFIGURACIÓN TURBO
-  const CHATS_PER_CYCLE = 15; // Reiniciar navegador cada 15 chats (ajustable)
-  const MAX_RAM_MB = 900;     // Si Node usa más de 900MB, forzar limpieza
-  
-  let page = initialPage; // Puntero a la página activa
-  let chatsSinceRestart = 0;
+  let globalProcessed = 0;
 
-  for (let i = 0; i < totalChats; i++) {
-    const chat = chatList[i];
-    const myIndex = i + 1;
-    
-    // 1. MONITORIZACIÓN
-    const mem = getMemoryUsage();
-    chatsSinceRestart++;
-    
-    // console.log(`[MONITOR] RAM: ${mem.rss}MB | Ciclo: ${chatsSinceRestart}/${CHATS_PER_CYCLE}`);
-
-    // 2. REINICIO PREVENTIVO (La clave del rendimiento constante)
-    if (chatsSinceRestart > CHATS_PER_CYCLE || mem.rss > MAX_RAM_MB) {
-        console.log(`\n[GOBERNADOR] 🧹 Limpiando memoria (Ciclo ${chatsSinceRestart} chats / ${mem.rss} MB)...`);
-        
-        try {
-            await page.reload({ waitUntil: "domcontentloaded" });
-            await page.waitForTimeout(4000); // Esperar reconexión de socket
-            // Esperar a que cargue la lista lateral
-            await page.waitForSelector('#pane-side', { timeout: 60000 });
-            console.log("[GOBERNADOR] ✅ Navegador fresco y listo.");
-        } catch (e) {
-            console.warn("[GOBERNADOR] ⚠️ Error en recarga:", e.message);
-        }
-        
-        chatsSinceRestart = 0;
-    }
-
-    // 3. PROCESAR (Pasamos la página actual, que puede haber cambiado)
+  for (const chat of chatList) {
+    const myIndex = ++globalProcessed;
     await processSingleChatOnPage(
-      page, // IMPORTANTE: Usar la variable actualizada
+      page,
       chat,
       db,
       retryList,
@@ -1087,12 +1085,9 @@ async function phase2_extractChats_Sequential(initialPage, chatList, incompleteM
       myIndex,
       totalChats
     );
-    
-    // Pequeña pausa para dejar respirar al garbage collector
-    if (i < totalChats - 1) await page.waitForTimeout(500);
   }
 
-  console.log(`\n[${nowTs()}] [FASE 2] Extracción completada.`);
+  console.log(`\n[${nowTs()}] [FASE 2] Extracción secuencial completada.`);
   return retryList;
 }
 
