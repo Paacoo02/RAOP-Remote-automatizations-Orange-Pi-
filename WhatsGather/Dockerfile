@@ -34,22 +34,16 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# ======================================================
-# 📦 Node + Playwright (sin package.json en el contexto)
-# ======================================================
-ENV PLAYWRIGHT_VERSION_TARGET=1.40.0
+# 1. Copiamos SOLO los ficheros de dependencias primero
+COPY package*.json ./
+
+# 2. Instalamos TODAS las dependencias definidas en tu package.json
+RUN npm install
+
+# 3. Instalamos los navegadores de Playwright
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN mkdir -p /ms-playwright && chown -R root:root /ms-playwright
-
-# Creamos un package.json mínimo dentro de la imagen e instalamos lo que necesitamos
-RUN --mount=type=cache,target=/root/.npm bash -lc '\
-  echo "📦 Creando package.json mínimo en /app..."; \
-  npm init -y >/dev/null 2>&1; \
-  echo "📥 Instalando playwright@${PLAYWRIGHT_VERSION_TARGET} y playwright-core@${PLAYWRIGHT_VERSION_TARGET}..."; \
-  npm install --omit=dev playwright@${PLAYWRIGHT_VERSION_TARGET} playwright-core@${PLAYWRIGHT_VERSION_TARGET}; \
-  echo "🧭 Instalando navegador Chromium para Playwright..."; \
-  npx playwright install --with-deps chromium \
-'
+RUN npx playwright install --with-deps chromium
 
 # Si en el futuro tu script usa más librerías, añádelas aquí, por ejemplo:
 # RUN npm install --omit=dev qrcode-terminal whatsapp-web.js
