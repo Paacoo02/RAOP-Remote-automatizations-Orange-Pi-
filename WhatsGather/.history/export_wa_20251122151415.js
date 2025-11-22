@@ -242,261 +242,191 @@ function markChatIncomplete(incompleteMap, chat, reason) {
   }
 }
 
+// -------------------------------------------------------------
+//  SCRAPER INTEGRADO (TU CÓDIGO ADAPTADO A NODE)
+// -------------------------------------------------------------
+// -------------------------------------------------------------
+//  SCRAPER: TU CÓDIGO EXACTO + DETECCIÓN DE SINCRONIZACIÓN
+// -------------------------------------------------------------
+// -------------------------------------------------------------
+//  SCRAPER: TU CÓDIGO EXACTO + SENSOR DE MURO CON RETARDO (3s)
+// -------------------------------------------------------------
+// -------------------------------------------------------------
+//  SCRAPER TURBO: CSS HACK + SENSOR DE MURO
+// -------------------------------------------------------------
 async function exportCurrentChatFromPage(page) {
   return await page.evaluate(async () => {
-    console.log("[BROWSER-DBG] 🔨 Iniciando Scraper con Lógica de Persistencia...");
+    // ⚡ HACK DE RENDIMIENTO: Ocultar media y anular animaciones
+    // Esto reduce drásticamente el uso de CPU/GPU al hacer scroll
+    const styleId = 'wa-turbo-mode-style';
+    if (!document.getElementById(styleId)) {
+        const style = document.createElement('style');
+        style.id = styleId;
+        style.innerHTML = `
+            * { transition: none !important; animation: none !important; }
+            img, video, canvas { display: none !important; } 
+            div[role="button"] img { display: none !important; }
+            /* Mantener solo texto visible */
+        `;
+        document.head.appendChild(style);
+        console.log("[Browser] ⚡ Turbo Mode CSS inyectado (Imágenes ocultas).");
+    }
 
-    return new Promise(async (resolve) => {
-      // --- CONFIGURACIÓN ---
-      const SCROLL_SLEEP = 1000;    // Tiempo estándar entre scrolls
-      const SYNC_WAIT   = 4000;     // Tiempo extra si está "Sincronizando"
-      const MAX_STAGNATION = 20;    // Rondas sin mensajes nuevos antes de rendirse
+    if (window.__waCounterAuto) { try { window.__waCounterAuto.stop(); } catch(e){} }
 
-      if (window.__waCounterAuto) { try { window.__waCounterAuto.stop(); } catch(e){} }
+    const seen = new Set();
+    const messagesMap = new Map();
+    let scroller = null, running = true;
+    let syncWallHit = false;
+    let jumpAnchor = null;
 
-      const seen = new Set();
-      const messagesMap = new Map();
-      let scroller = null, running = true;
+    // Reducimos tiempo de espera entre scrolls (de 600 a 400ms)
+    // Al no haber imágenes, carga más rápido.
+    const SCROLL_DELAY = 400; 
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    
+    const getCopyables = () => document.querySelectorAll("div.copyable-text,[data-pre-plain-text], div.message-in, div.message-out");
 
-      // Variables de retorno
-      let syncWallHit = false;
-      let jumpAnchor = null;
+    const WALL_TEXTS = [
+      "Haz clic aquí para obtener mensajes anteriores",
+      "No se pudieron obtener mensajes anteriores",
+      "Abre WhatsApp en tu teléfono",
+      "Se están sincronizando mensajes más antiguos",
+      "mensajes anteriores de tu teléfono"
+    ];
 
-      // Flags internos
-      let hardWallSeen   = false;
-      let hardWallAnchor = null;
+    function parseInfo(node){
+      const pre = node.getAttribute?.("data-pre-plain-text") || "";
+      // Selectores optimizados
+      const textEl = node.querySelector("span.selectable-text") || node.querySelector("div.selectable-text");
+      const text = textEl ? textEl.innerText : (node.innerText || "");
+      
+      if (!pre && !text) return null;
+      
+      const uid = pre + "|" + text.substring(0, 40);
+      let ts = "", author = "";
+      const m = pre.match(/\[(.*?)\]\s*(.*?):\s?$/);
+      if (m){ ts = m[1]; author = m[2]; }
+      return { uid, ts, author, text: text.replace(/\r?\n/g, " "), pre };
+    }
 
-      const sleep = ms => new Promise(r => setTimeout(r, ms));
-      const getCopyables = () => document.querySelectorAll("div.copyable-text,[data-pre-plain-text]");
-
-      // --- CLASIFICACIÓN DE MUROS ---
-
-      const HARD_WALL_TEXTS = [
-        "Haz clic aquí para obtener mensajes anteriores de tu teléfono",
-        "No se pudieron obtener mensajes anteriores",
-        "Abre WhatsApp en tu teléfono",
-        "usar WhatsApp en tu teléfono"
-      ];
-
-      const SOFT_WALL_TEXTS = [
-        "Se están sincronizando mensajes más antiguos",
-        "se estan sincronizando mensajes mas antiguos",
-        // OJO: mejor NO tratar el mensaje de cifrado como "muro".
-        // "cifrado de extremo a extremo"
-      ];
-
-      function checkWallStatus() {
-        const main = document.querySelector("#main");
-        if (!main) return "NONE";
-        const txt = main.innerText || "";
-
-        if (HARD_WALL_TEXTS.some(w => txt.includes(w))) return "HARD";
-        if (SOFT_WALL_TEXTS.some(w => txt.includes(w))) return "SOFT";
-        return "NONE";
-      }
-
-      // --- PARSEO Y ESCANEO ---
-      function parseInfo(node){
-        const pre = node.getAttribute?.("data-pre-plain-text") || "";
-        const textEl = node.querySelector?.("span.selectable-text") || node.querySelector?.("div.selectable-text");
-        const text = textEl ? textEl.innerText : "";
-        if (!pre && !text) return null;
-        const uid = pre + "|" + text;
-        let ts = "", author = "";
-        const m = pre.match(/\[(.*?)\]\s*(.*?):\s?$/);
-        if (m){ ts = m[1]; author = m[2]; }
-        return { uid, ts, author, text, pre };
-      }
-
-      function scan(){
-        let added = 0;
-        getCopyables().forEach(node=>{
-          const info = parseInfo(node);
-          if (!info) return;
-          if (!seen.has(info.uid)){
-            seen.add(info.uid);
-            messagesMap.set(info.uid, info);
-            added++;
-          }
-        });
-        return added;
-      }
-
-      function download(name, content, type){
-        console.log(`[BROWSER-DBG] ✅ FIN. Título: ${name} | Total: ${messagesMap.size}`);
-        resolve({
-          title: name.replace(".txt", ""),
-          count: messagesMap.size,
-          fullText: content,
-          syncRequired: syncWallHit,
-          jumpQuery: jumpAnchor
-        });
-      }
-
-      function getChatTitle(){
-        const header = document.querySelector("#main header");
-        if (header){
-          const selectors = [
-            'span.x1iyjqo2.x6ikm8r.x10wlt62.x1n2onr6.xlyipyv.xuxw1ft.x1rg5ohu._ao3e',
-            '[data-testid="conversation-info-header-chat-title"]',
-            'span[title]',
-            '[title]'
-          ];
-          for (const sel of selectors){
-            const el = header.querySelector(sel);
-            if (el){ return (el.getAttribute("title") || el.textContent || "").trim(); }
-          }
+    function scan(){
+      let added = 0;
+      const nodes = getCopyables();
+      // Bucle for clásico es ligeramente más rápido que forEach en V8 antiguo, pero aquí da igual
+      for (const node of nodes) {
+        const info = parseInfo(node);
+        if (!info) continue;
+        if (!seen.has(info.uid)){
+          seen.add(info.uid);
+          messagesMap.set(info.uid, info);
+          added++;
         }
-        return "whatsapp_chat";
       }
+      return added;
+    }
 
-      function exportTXT(){
-        const lines = [];
-        for (const info of messagesMap.values()){
-          const author = info.author || "Yo";
-          const ts     = info.ts || "";
-          const text   = (info.text || "").replace(/\r?\n/g, " ");
-          lines.push(`[${ts}] ${author}: ${text}`);
-        }
-        let t = getChatTitle().replace(/[\\/:*?"<>|]+/g, " ").trim();
-        if(!t) t = "chat";
-        download(t + ".txt", lines.join("\n"), "text/plain;charset=utf-8");
-      }
+    function checkForSyncWall() {
+       const main = document.querySelector("#main");
+       if (!main) return false;
+       // Usamos textContent que es más barato que innerText (no calcula estilos)
+       const txt = main.textContent; 
+       for (const w of WALL_TEXTS) {
+           if (txt.includes(w)) return true;
+       }
+       return false;
+    }
 
-      function findScrollContainer(){
-        const candidates = [
-          '[data-testid="conversation-panel-body"]',
-          '[data-testid="conversation-panel-messages"]',
-          '#main [tabindex="-1"]',
-          '#main'
-        ].map(sel => document.querySelector(sel)).filter(Boolean);
-
-        const anyMsg = getCopyables()[0];
-        if (anyMsg){
-          let p = anyMsg.parentElement;
-          while (p){
-            const st = getComputedStyle(p);
-            if ((st.overflowY === 'auto' || st.overflowY === 'scroll') && p.scrollHeight > p.clientHeight + 20) {
-              candidates.push(p);
-            }
-            p = p.parentElement;
-          }
-        }
-        const uniq = Array.from(new Set(candidates));
-        uniq.sort((a,b)=> (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
-        return uniq.find(el => el && el.scrollHeight > el.clientHeight + 20) || null;
-      }
-
-      function getOldestVisibleText() {
+    function getOldestVisibleText() {
         const nodes = getCopyables();
         if (nodes.length > 0) {
-          const info = parseInfo(nodes[0]);
-          if (info && info.text && info.text.length > 5) return info.text.substring(0, 50);
+            const info = parseInfo(nodes[0]); 
+            if (info && info.text && info.text.length > 5) return info.text.substring(0, 50);
         }
         return null;
+    }
+
+    function getChatTitle(){
+        // Lógica simplificada de título
+        const h = document.querySelector("#main header span[title]");
+        return h ? (h.getAttribute("title") || h.innerText) : "chat";
+    }
+
+    function findScrollContainer(){
+      // Buscamos el panel de mensajes directamente
+      // El ID "main" suele contener un div con tabindex="-1" que es el scroller
+      const main = document.getElementById('main');
+      if (!main) return null;
+      
+      // Estrategia rápida: buscar el div más grande con overflow
+      const divs = main.querySelectorAll('div[tabindex="-1"]');
+      for (const d of divs) {
+          if (d.scrollHeight > d.clientHeight) return d;
+      }
+      return null;
+    }
+
+    async function run(){
+      scroller = findScrollContainer();
+      if (!scroller){ scan(); return; }
+
+      // MutationObserver es caro en CPU si hay muchos cambios.
+      // En modo Turbo, confiamos más en el intervalo y el scroll.
+      // const obs = new MutationObserver(()=> scan()); ... (Desactivado para ahorrar CPU)
+
+      scan();
+      
+      // Polling más rápido
+      const timer = setInterval(scan, 500);
+
+      let stagnation = 0, rounds = 0, maxStagnation = 8; // Bajamos estancamiento a 8
+      
+      while (running) {
+        if (checkForSyncWall()) {
+            // Check rápido
+            console.log("[Browser] 🧱 Muro detectado. Confirmando...");
+            await sleep(2500);
+            if (checkForSyncWall()) {
+                syncWallHit = true;
+                jumpAnchor = getOldestVisibleText();
+                break; 
+            }
+        }
+
+        rounds++;
+        const before = seen.size;
+        
+        // Scroll agresivo
+        try { scroller.scrollTop = 0; } catch(e){}
+        
+        await sleep(SCROLL_DELAY);
+        const added = scan();
+        const after = seen.size;
+        
+        stagnation = (added === 0 && after === before) ? (stagnation+1) : 0;
+        if (stagnation >= maxStagnation) break;
       }
 
-      // --- EJECUCIÓN ---
-      async function run(){
-        scroller = findScrollContainer();
-        if (!scroller){
-          console.error("[BROWSER-DBG] ❌ Sin scroll.");
-          resolve({ count: 0, fullText: "" });
-          return;
-        }
+      try { clearInterval(timer); } catch(e){}
+      running = false;
+    }
 
-        const target = document.querySelector("#main") || document.body;
-        const obs = new MutationObserver(()=> scan());
-        obs.observe(target, {subtree:true, childList:true});
+    await run();
 
-        console.log("[BROWSER-DBG] ⬇️ Bajando al fondo para iniciar...");
-        scroller.scrollTop = scroller.scrollHeight;
-        await sleep(2000);
-        const initial = scan();
-        console.log(`[BROWSER-DBG] Inicio con ${initial} mensajes.`);
+    // Retorno optimizado
+    const lines = [];
+    for (const info of messagesMap.values()){
+       // Concatenación directa es rápida
+       lines.push(`[${info.ts||""}] ${info.author||"Yo"}: ${info.text}`);
+    }
 
-        let stagnation = 0;
-        let rounds = 0;
-
-        while (running) {
-          rounds++;
-
-          // --- 1. DETECCIÓN MURO ---
-          const wallStatus = checkWallStatus();
-
-          if (wallStatus === "HARD") {
-            // Sólo marcamos la info, no rompemos el bucle
-            if (!hardWallSeen) {
-              console.log("[BROWSER-DBG] ⛔ HARD WALL DETECTADO (Teléfono). Confirmando...");
-              await sleep(2000);
-              if (checkWallStatus() === "HARD") {
-                console.log("[BROWSER-DBG] 🧱 Muro confirmado (pero seguimos scrolleando hasta estancamiento).");
-                hardWallSeen   = true;
-                hardWallAnchor = getOldestVisibleText();
-              }
-            }
-          } else if (wallStatus === "SOFT") {
-            console.log("[BROWSER-DBG] ⏳ Sincronizando... (Esperando 4s extra)");
-            await sleep(SYNC_WAIT);
-          }
-
-          // --- 2. SCROLL HACIA ARRIBA ---
-          const before = seen.size;
-
-          try {
-            scroller.scrollTop = 0;
-            scroller.dispatchEvent(new Event('scroll'));
-
-            // Si era muro suave, hacemos baile extra
-            if (wallStatus === "SOFT") {
-              await sleep(200);
-              scroller.scrollTop = 100;
-              await sleep(200);
-              scroller.scrollTop = 0;
-            }
-          } catch(e){}
-
-          await sleep(SCROLL_SLEEP);
-
-          const added = scan();
-          const after = seen.size;
-          const realAdded = after - before;
-
-          if (realAdded === 0) {
-            stagnation++;
-          } else {
-            stagnation = 0;
-          }
-
-          if (realAdded > 0 || rounds % 5 === 0) {
-            console.log(`[BROWSER-DBG] Ronda ${rounds} | Total: ${after} (+${realAdded}) | Estancamiento: ${stagnation}/${MAX_STAGNATION}`);
-          }
-
-          if (stagnation >= MAX_STAGNATION) {
-            console.log("[BROWSER-DBG] 🛑 Fin por estancamiento (No hay más mensajes).");
-            break;
-          }
-        }
-
-        try { obs.disconnect(); } catch(e){}
-
-        // Ajustamos flags de salida según lo que hayamos visto
-        if (hardWallSeen) {
-          syncWallHit = true;
-          jumpAnchor  = hardWallAnchor;
-        }
-
-        exportTXT();
-        running = false;
-        delete window.__waCounterAuto;
-      }
-
-      window.__waCounterAuto = {
-        stop(){ running = false; resolve({count: messagesMap.size}); }
-      };
-
-      run();
-    });
+    return {
+        title: getChatTitle(),
+        count: messagesMap.size,
+        fullText: lines.join("\n"),
+        syncRequired: syncWallHit,
+        jumpQuery: jumpAnchor
+    };
   });
 }
 
@@ -870,35 +800,17 @@ async function phase1_discoverChats(page) {
 // -------------------------------------------------------------
 
 async function getChatSearchBox(page) {
-  // Intentar encontrar la caja directamente
   const selectors = [
     '#side [contenteditable="true"][data-tab="3"]',
     'div[role="textbox"][contenteditable="true"][data-tab="3"]',
-    '#side [contenteditable="true"]'
+    '#side [contenteditable="true"]',
   ];
-  
   for (const sel of selectors) {
+    const loc = page.locator(sel);
     try {
-      const loc = page.locator(sel).first();
-      if (await loc.count() > 0 && await loc.isVisible()) return loc;
+      if ((await loc.count()) > 0) return loc.first();
     } catch {}
   }
-
-  // Si no aparece, intentar hacer clic en el botón de Lupa (a veces está colapsado)
-  try {
-      const searchIcon = page.locator('span[data-testid="search"], span[data-icon="search"]').first();
-      if (await searchIcon.isVisible()) {
-          console.log("[Debug] Pulsando icono de lupa para revelar buscador...");
-          await searchIcon.click();
-          await page.waitForTimeout(500);
-          // Reintentar selectores
-          for (const sel of selectors) {
-             const loc = page.locator(sel).first();
-             if (await loc.count() > 0) return loc;
-          }
-      }
-  } catch {}
-
   return null;
 }
 
@@ -920,96 +832,46 @@ function normalizeChatTitleForSearch(chatTitle) {
   }
 }
 
-const v8 = require('v8');
-
-function getMemoryUsage() {
-  const used = process.memoryUsage();
-  return {
-    rss: Math.round(used.rss / 1024 / 1024), // Memoria física total
-    heapTotal: Math.round(used.heapTotal / 1024 / 1024),
-    heapUsed: Math.round(used.heapUsed / 1024 / 1024),
-  };
-}
-
+// -------------------------------------------------------------
+//  FUNCIÓN DE APERTURA: FUERZA BRUTA (COORDENADAS FÍSICAS)
+// -------------------------------------------------------------
+// -------------------------------------------------------------
+//  FUNCIÓN DE APERTURA: TECLADO PURO (Flecha Abajo + Enter)
+// -------------------------------------------------------------
+// -------------------------------------------------------------
+//  APERTURA RÁPIDA (TIEMPOS AJUSTADOS)
+// -------------------------------------------------------------
 async function openChatByTitle(page, chatTitle) {
   const searchBox = await getChatSearchBox(page);
   if (!searchBox) throw new Error("Buscador no encontrado.");
 
-  // -----------------------------------------------------
-  // 1. LIMPIEZA DE EMOJIS (WHITELIST CORREGIDA)
-  // -----------------------------------------------------
-  // Corrección: Eliminamos los escapes innecesarios (\, \_ \() que causaban el crash.
-  // Mantenemos: Letras, Números, Espacios, Puntos, Comas, Guiones, Guion bajo, Paréntesis y Barras.
-  let searchTerm = chatTitle
-      .replace(/[^\p{L}\p{N}\s.,\-_()\/]/gu, "") // Regex corregida para Node.js con flag 'u'
-      .replace(/\s+/g, " ")                      // Colapsa espacios dobles
-      .trim();
+  const cleanTitle = chatTitle.normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{Letter}\p{Number}\s]/gu, "").replace(/\s+/g, " ").trim().toLowerCase();
 
-  // Fallback: Si el nombre era SOLO emojis, intentamos el literal
-  if (!searchTerm) {
-      console.warn("[FASE 2] ⚠️ El nombre tras limpiar quedó vacío. Intentando búsqueda literal...");
-      searchTerm = chatTitle.trim();
-  }
+  console.log(`[FASE 2] Buscando: "${cleanTitle}"`);
 
-  console.log(`[FASE 2] Buscando: "${searchTerm}" (Original: "${chatTitle.substring(0, 15)}...")`);
-
-  // 2. Limpiar y Escribir
+  await searchBox.click();
+  
+  // Limpieza rápida (Triple clic selecciona todo el texto habitualmente)
   await searchBox.click({ clickCount: 3 });
   await page.keyboard.press("Backspace");
-  await page.waitForTimeout(300);
-  await page.keyboard.type(searchTerm, { delay: 50 });
   
-  // 3. ESPERAR RESULTADOS (Filtrando encabezados)
-  try {
-      // Esperamos filas que tengan un título real
-      await page.waitForSelector('#pane-side div[role="row"] span[title]', { timeout: 6000 });
-  } catch (e) {
-      console.warn(`[FASE 2] ⚠️ No se encontró: "${searchTerm}".`);
-      await page.keyboard.press("Escape");
-      throw new Error("Chat no encontrado tras búsqueda.");
-  }
+  // Escritura rápida (30ms delay es suficiente para WA)
+  await page.keyboard.type(cleanTitle, { delay: 30 });
+  
+  // Espera reducida (1.2s suele bastar para que filtre localmente)
+  await page.waitForTimeout(1200);
 
-  // 4. SELECCIONAR LA FILA CORRECTA
-  // Usamos :has(span[title]) para evitar el encabezado "Chats"
-  const rowLocator = page.locator('#pane-side div[role="row"]:has(span[title])').first();
-  
-  if (await rowLocator.count() > 0) {
-      // Intentamos clic en el texto del título para evitar avatar
-      const titleElement = rowLocator.locator('span[title]').first();
-      
-      if (await titleElement.count() > 0) {
-          await titleElement.click();
-      } else {
-          // Fallback puntería calibrada
-          const box = await rowLocator.boundingBox();
-          if (box) {
-             await page.mouse.click(box.x + 100, box.y + (box.height / 2));
-          } else {
-             await rowLocator.click();
-          }
-      }
-  }
+  // Selección Teclado
+  await page.keyboard.press("ArrowDown");
+  await page.waitForTimeout(100); // Mínima espera
+  await page.keyboard.press("Enter");
 
-  // 5. VERIFICAR APERTURA
-  console.log("[FASE 2] Verificando apertura...");
-  try {
-      await page.waitForSelector('#main header, #main footer', { timeout: 8000 });
-      console.log("[FASE 2] ✅ Chat abierto correctamente.");
-  } catch(e) {
-      console.error("[FASE 2] ❌ Timeout visual. Probando ENTER final...");
-      await page.keyboard.press("Enter");
-      
-      try {
-        await page.waitForSelector('#main header', { timeout: 3000 });
-      } catch(finalErr) {
-        await page.keyboard.press("Escape");
-        throw new Error("No se abrió el chat (timeout)");
-      }
-  }
-  
+  // Limpieza UI
+  await page.waitForTimeout(800);
+  await page.keyboard.press("Escape"); 
   await page.waitForTimeout(1000);
 }
- 
 
 // -------------------------------------------------------------
 //  FASE 2: PROCESO DE UN SOLO CHAT
@@ -1116,65 +978,50 @@ async function processSingleChatOnPage(page, chat, db, retryList, incompleteMap,
       // 1. Abrir
       await openChatByTitle(page, chat.title);
       
-      // 2. Verificar carga (Footer O Header del chat)
+      // 2. Verificar carga (Footer)
       try {
-        // Buscamos el footer (input de texto) O el header del chat (que indica que ya no estamos en home)
-        await page.waitForSelector(
-            'footer, [data-testid="box-chat-footer"], #main header, [role="application"]', 
-            { timeout: 15000 } // Damos 15s generosos
-        );
+        await page.waitForSelector('footer, [data-testid="box-chat-footer"], [role="application"]', { timeout: 10000 });
         console.log("[FASE 2] ✅ Interfaz de chat cargada.");
       } catch (e) {
-        throw new Error("No se cargó la interfaz del chat (footer/header invisible) tras 15s.");
+        throw new Error("No se cargó la interfaz del chat (footer no visible).");
       }
 
-      // 3. EJECUTAR TU SCRIPT DE EXTRACCIÓN
-      console.log(`[FASE 2] 📤 Ejecutando script de extracción...`);
+      // 3. Extraer
+      console.log(`[FASE 2] 📤 Extrayendo mensajes...`);
       const exportResult = await exportCurrentChatFromPage(page);
 
-      // 4. GUARDAR RESULTADOS
+      // 4. Guardar
       if (exportResult && exportResult.count > 0) {
-        const title = exportResult.title || chat.title;
+        const title = exportResult.title || chat.title || "whatsapp_chat";
         const sanitized = sanitizeFilename(title);
         const filePath = path.join(EXPORT_DIR, `${sanitized}.txt`);
 
-        // Usamos fullText que viene directo de tu script
+        // Guardamos el texto completo devuelto por el navegador
         fs.writeFileSync(filePath, exportResult.fullText, "utf8");
         console.log(`[FASE 2] ✅ Guardado "${filePath}" (${exportResult.count} mensajes)`);
         
         try { await db.run("INSERT INTO Exports(sessionId, chatTitle, filePath, exportedAt) VALUES(?,?,?,datetime('now'))", sessionId, title, filePath); } catch(e){}
-      } else {
-        console.log(`[FASE 2] ℹ️ Chat vacío.`);
       }
 
-      // 5. DETECTAR SI NECESITA JUMP (Para Fase 3)
+      // 🔴 LÓGICA DE REINTENTO (JUMP)
       if (exportResult.syncRequired) {
-          console.log(`[FASE 2] 🧱 Muro de sincronización detectado. Añadido a reintentos.`);
+          console.log(`[FASE 2] 🧱 Muro de sincronización detectado. Se programará SALTO.`);
           retryList.push({
              ...chat,
-             jumpQuery: exportResult.jumpQuery,
+             jumpQuery: exportResult.jumpQuery, // Guardamos la frase clave
              reason: "sync-wall"
           });
       } else {
-          console.log(`[FASE 2] 🟢 Chat completo.`);
+          console.log(`[FASE 2] 🟢 Chat completado sin muros.`);
       }
 
-      return true;
+      return true; 
 
     } catch (e) {
       console.warn(`[FASE 2] ⚠️ Intento ${attempt} fallido: ${e.message}`);
-      
-      // Lógica de recuperación: Si el buscador no aparece, la página está rota.
-      if (e.message.includes("Buscador no encontrado") || e.message.includes("service-worker")) {
-          console.log("🔄 Detectado fallo crítico de UI. Recargando página...");
-          await page.reload({ waitUntil: "domcontentloaded" });
-          await page.waitForTimeout(5000); // Esperar reconexión
-          await page.waitForSelector("#pane-side", { timeout: 30000 });
-      } else {
-          // Error menor, intentar limpiar foco
-          await page.keyboard.press('Escape');
-          await page.waitForTimeout(1000);
-      }
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(1000);
+      if (attempt >= 3) await page.reload({ waitUntil: "domcontentloaded" });
     }
   }
   
@@ -1189,46 +1036,50 @@ async function processSingleChatOnPage(page, chat, db, retryList, incompleteMap,
 // -------------------------------------------------------------
 //  FASE 2: EXTRACCIÓN TURBO (CON GESTIÓN DE MEMORIA)
 // -------------------------------------------------------------
-// -------------------------------------------------------------
-//  FASE 2: EXTRACCIÓN (CONFIGURACIÓN RELAJADA)
-// -------------------------------------------------------------
 async function phase2_extractChats_Sequential(initialPage, chatList, incompleteMap) {
-  console.log(`\n[${nowTs()}] [FASE 2] 🐢 Iniciando Extracción Secuencial (Modo Estable)...`);
+  console.log(`\n[${nowTs()}] [FASE 2] 🚀 Iniciando TURBO MODE secuencial...`);
 
   const db = await dbPromise;
   const retryList = [];
   const totalChats = chatList.length;
   
-  // AJUSTE: Límites más altos para reiniciar menos veces (más estabilidad)
-  const CHATS_PER_CYCLE = 50; // Reiniciar cada 50 chats (antes 15)
-  const MAX_RAM_MB = 2500;    // Reiniciar solo si pasa de 2.5GB de RAM (antes 900MB)
+  // CONFIGURACIÓN TURBO
+  const CHATS_PER_CYCLE = 15; // Reiniciar navegador cada 15 chats (ajustable)
+  const MAX_RAM_MB = 900;     // Si Node usa más de 900MB, forzar limpieza
   
-  let page = initialPage;
+  let page = initialPage; // Puntero a la página activa
   let chatsSinceRestart = 0;
 
   for (let i = 0; i < totalChats; i++) {
     const chat = chatList[i];
     const myIndex = i + 1;
     
-    // Monitorización
+    // 1. MONITORIZACIÓN
     const mem = getMemoryUsage();
     chatsSinceRestart++;
     
-    // Solo reiniciamos si es estrictamente necesario
+    // console.log(`[MONITOR] RAM: ${mem.rss}MB | Ciclo: ${chatsSinceRestart}/${CHATS_PER_CYCLE}`);
+
+    // 2. REINICIO PREVENTIVO (La clave del rendimiento constante)
     if (chatsSinceRestart > CHATS_PER_CYCLE || mem.rss > MAX_RAM_MB) {
-        console.log(`\n[MANTENIMIENTO] 🧹 Refrescando navegador (Ciclo ${chatsSinceRestart} chats / ${mem.rss} MB)...`);
+        console.log(`\n[GOBERNADOR] 🧹 Limpiando memoria (Ciclo ${chatsSinceRestart} chats / ${mem.rss} MB)...`);
+        
         try {
             await page.reload({ waitUntil: "domcontentloaded" });
-            await page.waitForTimeout(5000); // 5s de cortesía para reconectar
+            await page.waitForTimeout(4000); // Esperar reconexión de socket
+            // Esperar a que cargue la lista lateral
             await page.waitForSelector('#pane-side', { timeout: 60000 });
+            console.log("[GOBERNADOR] ✅ Navegador fresco y listo.");
         } catch (e) {
-            console.warn("[MANTENIMIENTO] ⚠️ Error en recarga:", e.message);
+            console.warn("[GOBERNADOR] ⚠️ Error en recarga:", e.message);
         }
+        
         chatsSinceRestart = 0;
     }
 
+    // 3. PROCESAR (Pasamos la página actual, que puede haber cambiado)
     await processSingleChatOnPage(
-      page, 
+      page, // IMPORTANTE: Usar la variable actualizada
       chat,
       db,
       retryList,
@@ -1237,8 +1088,8 @@ async function phase2_extractChats_Sequential(initialPage, chatList, incompleteM
       totalChats
     );
     
-    // Pausa pequeña entre chats para no saturar
-    if (i < totalChats - 1) await page.waitForTimeout(1000);
+    // Pequeña pausa para dejar respirar al garbage collector
+    if (i < totalChats - 1) await page.waitForTimeout(500);
   }
 
   console.log(`\n[${nowTs()}] [FASE 2] Extracción completada.`);
